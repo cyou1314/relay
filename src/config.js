@@ -74,6 +74,14 @@ function normalizeUpstream(raw, idx) {
       inputPer1k: Number(price.inputPer1k || 0),
       outputPer1k: Number(price.outputPer1k || 0),
     },
+    // Which quota source serves this upstream (src/quota.js). The
+    // dedicated field wins over the legacy `quota.source` so real
+    // sources can be declared without disturbing the quota block's
+    // source-specific parameters (mock values, metering window):
+    //   "codex-usage"  official Codex usage endpoint, credential read
+    //                  from the local sign-in at fetch time — never
+    //                  from this file.
+    quotaSource: typeof raw.quotaSource === 'string' ? raw.quotaSource : null,
     quota: raw.quota && typeof raw.quota === 'object' ? raw.quota : { source: 'unavailable' },
     enabled: raw.enabled !== false,
   };

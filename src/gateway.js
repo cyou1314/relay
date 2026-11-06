@@ -43,7 +43,10 @@
  * <repo>/relay.config.json; see src/config.js), POST /v1/responses is
  * served by the routing engine instead of the single env upstream:
  *   - src/upstreams.js  registry of configured upstreams (kind/tier/price)
- *   - src/quota.js      quota sources (mock / metering-estimate / unavailable)
+ *   - src/quota.js      quota sources (mock / metering-estimate /
+ *                       codex-usage — the official Codex usage endpoint,
+ *                       background-refreshed behind a 60s cache —
+ *                       / unavailable)
  *   - src/router.js     priority + stickiness + pins + sensitive fail-closed
  *   - src/difficulty.js task-difficulty classifier (second routing axis)
  * Every ATTEMPT is logged with requestId, chosen upstream, attempt number,
@@ -119,6 +122,10 @@ try { CONFIG = loadConfig(); } catch (err) {
 }
 const registry = CONFIG ? createRegistry(CONFIG) : null;
 const quotaService = CONFIG ? createQuotaService({ config: CONFIG, registry, logFile: LOG_FILE }) : null;
+// Warm the real quota sources (codex-usage) in the background so the
+// first routed request and the first dashboard view already see real
+// numbers; warmup never blocks startup and never fails it.
+if (quotaService) quotaService.warmup();
 // Live dashboard (read-only): GET / + /dashboard serve the page,
 // GET /api/status serves the JSON. Works in legacy mode too (no
 // registry -> no quota cards; the log still drives today + recent).

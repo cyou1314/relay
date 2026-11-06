@@ -117,6 +117,16 @@ function timeText(ts) {
   return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
 }
 
+/**
+ * Two-window detail line for sources that report both windows
+ * (codex-usage): 「5 小时内还剩 X%，这周还剩 Y%」. The big number on the
+ * card is the tighter window; this line keeps both in view, in words.
+ */
+function windowsDetail(q) {
+  if (!q || !q.windows || !q.windows.primary || !q.windows.secondary) return null;
+  return `5 小时内还剩 ${Math.round(q.windows.primary.remainingPct)}%，这周还剩 ${Math.round(q.windows.secondary.remainingPct)}%`;
+}
+
 function quotaHint(q) {
   if (!q || q.remainingPct == null) return '暂时不知道还剩多少';
   if (q.resetsAt) {
@@ -208,6 +218,8 @@ function createDashboard({ config, registry, quotaService, logFile, feedbackFile
           source: q.source,
           estimate: q.source === 'metering-estimate',
           hint: quotaHint(q),
+          windows: q.windows || null,
+          detail: windowsDetail(q),
         });
       }
     }
@@ -386,7 +398,8 @@ const PAGE_HTML = `<!doctype html>
     var hintStyle = pct == null ? '' : (q.resetsAt ? '' : ' style="margin-top:16px"');
     return '<div class="card glass' + (animate ? ' rise' : '') + '" style="--d:' + (0.05 + idx * 0.08).toFixed(2) + 's">'
       + '<h3>' + esc(q.name) + ' 剩余额度</h3>' + big + bar
-      + '<div class="hint"' + hintStyle + '>' + esc(q.hint) + '</div></div>';
+      + '<div class="hint"' + hintStyle + '>' + esc(q.hint) + '</div>'
+      + (q.detail ? '<div class="hint">' + esc(q.detail) + '</div>' : '') + '</div>';
   }
   function spendCard(d, idx, animate){
     var hint = d.today.subscriptionServed > 0
@@ -472,4 +485,4 @@ const PAGE_HTML = `<!doctype html>
 </html>
 `;
 
-module.exports = { createDashboard, humanWhy, REASON_WHY, FALLBACK_WHY, strategyText, displayName, DEFAULT_USD_CNY };
+module.exports = { createDashboard, humanWhy, REASON_WHY, FALLBACK_WHY, strategyText, displayName, windowsDetail, DEFAULT_USD_CNY };

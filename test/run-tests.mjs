@@ -813,6 +813,129 @@ try {
     const html = await (await fetch(`${F}/dashboard`)).text();
     check('page still carries the friendly empty-state sentence', html.includes('还没有记录，等你用 Codex 干活后'), '');
   }
+
+  // =======================================================================
+  // codex-usage quota source (credentials phase, platform step): the
+  // official Codex usage endpoint behind a 60 s background-refreshed
+  // cache. All HTTP is an injected fake; the credential file is a
+  // fixture with dummy values — no real sign-in is touched here.
+  // =======================================================================
+  console.log('test 37: codex-usage — window mapping, credential headers, 60s cache');
+  {
+    const quotaMod = await import('file://' + path.join(root, 'src/quota.js'));
+    const upModQ = await import('file://' + path.join(root, 'src/upstreams.js'));
+    const { createQuotaService, mapCodexUsage, CODEX_USAGE_URL } = quotaMod.default;
+    const USAGE_BODY = {
+      rate_limit: {
+        primary_window: { used_percent: 38, reset_at: 1762485600 },
+        secondary_window: { used_percent: 15, reset_at: 1763074800 },
+      },
+    };
+    const mapped = mapCodexUsage(USAGE_BODY);
+    check('mapper: tighter window leads (primary 62% remaining)', Boolean(mapped) && mapped.remainingPct === 62 && mapped.source === 'codex-usage', JSON.stringify(mapped));
+    check('mapper: reset_at unix seconds -> ISO of the tighter window', mapped.resetsAt === new Date(1762485600 * 1000).toISOString(), String(mapped.resetsAt));
+    check('mapper: both windows kept (used + remaining)', mapped.windows.primary.usedPercent === 38 && mapped.windows.primary.remainingPct === 62 && mapped.windows.secondary.usedPercent === 15 && mapped.windows.secondary.remainingPct === 85, JSON.stringify(mapped.windows));
+    check('mapper: secondary leads when IT is tighter', mapCodexUsage({ rate_limit: { primary_window: { used_percent: 10, reset_at: 1762485600 }, secondary_window: { used_percent: 95, reset_at: 1763074800 } } }).remainingPct === 5);
+    check('mapper: junk payload -> null', mapCodexUsage({}) === null && mapCodexUsage(null) === null && mapCodexUsage({ rate_limit: { primary_window: { used_percent: 'x' }, secondary_window: { used_percent: 1, reset_at: 1 } } }) === null);
+
+    const authFile = path.join(coreDir, 'auth-fake.json');
+    fs.writeFileSync(authFile, JSON.stringify({ tokens: { access_token: 'FAKE_TOKEN_FOR_TEST', account_id: 'acct-test-123' } }));
+    let calls = 0; let seenUrl = null; let seenHeaders = null;
+    const fakeGet = async (url, headers) => { calls++; seenUrl = url; seenHeaders = headers; return { status: 200, body: JSON.stringify(USAGE_BODY) }; };
+    let fakeNow = 1_700_000_000_000;
+    const cfgQ = { upstreams: [{ id: 'codex-plan', kind: 'passthrough', tier: 'subscription', baseUrl: 'https://chatgpt.com/backend-api/codex/responses', models: [{ id: 'gpt-6-luna', capability: 'standard' }], quotaSource: 'codex-usage', quota: { source: 'unavailable' }, enabled: true }] };
+    const regQ = upModQ.default.createRegistry(cfgQ);
+    const svcQ = createQuotaService({ config: cfgQ, registry: regQ, logFile: path.join(coreDir, 'routing-none.jsonl'), codexHttpGet: fakeGet, codexAuthPath: authFile, nowFn: () => fakeNow });
+    const cold = svcQ.getQuota('codex-plan');
+    check('cold start degrades honestly (unavailable, no invented number)', cold.source === 'unavailable' && cold.remainingPct === null, JSON.stringify(cold));
+    const got = await svcQ.refreshCodexUsage();
+    check('refresh returns the mapped usage', Boolean(got) && got.remainingPct === 62 && got.source === 'codex-usage', JSON.stringify(got));
+    check('request went to the official usage URL', seenUrl === CODEX_USAGE_URL && seenUrl === 'https://chatgpt.com/backend-api/wham/usage', String(seenUrl));
+    check('credential headers taken from the sign-in file (fixture values)', Boolean(seenHeaders) && seenHeaders.authorization === 'Bearer FAKE_TOKEN_FOR_TEST' && seenHeaders['chatgpt-account-id'] === 'acct-test-123', JSON.stringify(seenHeaders && Object.keys(seenHeaders)));
+    const warm = svcQ.getQuota('codex-plan');
+    check('getQuota serves codex-usage with both windows', warm.source === 'codex-usage' && warm.remainingPct === 62 && warm.windows.secondary.remainingPct === 85 && warm.resetsAt === mapped.resetsAt, JSON.stringify(warm));
+    await svcQ.refreshCodexUsage();
+    svcQ.getQuota('codex-plan'); svcQ.getQuota('codex-plan');
+    check('60s cache: no repeat request inside the window', calls === 1, `calls=${calls}`);
+    fakeNow += 61_000;
+    await svcQ.refreshCodexUsage();
+    check('after 60s the cache refreshes (2nd request)', calls === 2, `calls=${calls}`);
+  }
+
+  console.log('test 38: codex-usage failure degradation — endpoint down/auth/missing file, metering fallback');
+  {
+    const quotaMod = await import('file://' + path.join(root, 'src/quota.js'));
+    const upModQ = await import('file://' + path.join(root, 'src/upstreams.js'));
+    const { createQuotaService } = quotaMod.default;
+    const authFile = path.join(coreDir, 'auth-fake.json'); // written by test 37
+    const mkSvc = (upstream, httpGet, authPath) => {
+      const cfg = { upstreams: [upstream] };
+      return createQuotaService({ config: cfg, registry: upModQ.default.createRegistry(cfg), logFile: path.join(coreDir, 'routing-none.jsonl'), codexHttpGet: httpGet, codexAuthPath: authPath });
+    };
+    const baseUp = (extra = {}) => ({ id: 'codex-plan', kind: 'passthrough', tier: 'subscription', baseUrl: 'https://chatgpt.com/backend-api/codex/responses', models: [{ id: 'gpt-6-luna', capability: 'standard' }], quotaSource: 'codex-usage', quota: { source: 'unavailable' }, enabled: true, ...extra });
+
+    let calls500 = 0;
+    const svc500 = mkSvc(baseUp(), async () => { calls500++; return { status: 500, body: 'server error' }; }, authFile);
+    check('HTTP 500 -> refresh yields nothing', (await svc500.refreshCodexUsage()) === null);
+    const q500 = svc500.getQuota('codex-plan');
+    check('HTTP 500 -> unavailable with null remaining (router keeps working)', q500.source === 'unavailable' && q500.remainingPct === null, JSON.stringify(q500));
+    svc500.getQuota('codex-plan'); svc500.getQuota('codex-plan');
+    check('failure is negatively cached (no retry storm)', calls500 === 1, `calls=${calls500}`);
+
+    const svc401 = mkSvc(baseUp(), async () => ({ status: 401, body: '{"error":{"code":"invalid_api_key"}}' }), authFile);
+    await svc401.refreshCodexUsage();
+    const q401 = svc401.getQuota('codex-plan');
+    check('HTTP 401 (stale sign-in) -> unavailable, not a crash', q401.source === 'unavailable' && q401.remainingPct === null, JSON.stringify(q401));
+
+    let callsMissing = 0;
+    const svcMissing = mkSvc(baseUp(), async () => { callsMissing++; return { status: 200, body: '{}' }; }, path.join(coreDir, 'auth-does-not-exist.json'));
+    check('missing credential file -> refresh yields nothing, no HTTP attempted', (await svcMissing.refreshCodexUsage()) === null && callsMissing === 0);
+    check('missing credential file -> unavailable', svcMissing.getQuota('codex-plan').source === 'unavailable');
+
+    const bareAuth = path.join(coreDir, 'auth-bare.json');
+    fs.writeFileSync(bareAuth, JSON.stringify({ tokens: {} }));
+    const svcBare = mkSvc(baseUp(), async () => ({ status: 200, body: '{}' }), bareAuth);
+    check('sign-in file without tokens -> unavailable', (await svcBare.refreshCodexUsage()) === null && svcBare.getQuota('codex-plan').source === 'unavailable');
+
+    // Metering fallback: same failure, but the upstream configured a
+    // metering window — the estimate takes over, honestly labeled.
+    const logM = path.join(coreDir, 'routing-meter-fallback.jsonl');
+    fs.writeFileSync(logM, JSON.stringify({ ts: new Date().toISOString(), path: '/v1/responses', upstream: 'codex-meter', status: 200, usage: { total_tokens: 15 } }) + '\n');
+    const meterUp = { ...baseUp(), id: 'codex-meter', quota: { source: 'metering', windowTokens: 150 } };
+    const cfgM = { upstreams: [meterUp] };
+    const svcM = createQuotaService({ config: cfgM, registry: upModQ.default.createRegistry(cfgM), logFile: logM, codexHttpGet: async () => ({ status: 503, body: 'down' }), codexAuthPath: authFile });
+    await svcM.refreshCodexUsage();
+    const qM = svcM.getQuota('codex-meter');
+    check('endpoint down + metering window -> metering-estimate 90% (15/150)', qM.source === 'metering-estimate' && qM.remainingPct === 90, JSON.stringify(qM));
+  }
+
+  console.log('test 39: dashboard shows codex-usage as real data with the two-window line');
+  {
+    const quotaMod = await import('file://' + path.join(root, 'src/quota.js'));
+    const upModQ = await import('file://' + path.join(root, 'src/upstreams.js'));
+    const dashMod = await import('file://' + path.join(root, 'src/dashboard.js'));
+    const authFile = path.join(coreDir, 'auth-fake.json'); // written by test 37
+    const USAGE_BODY = {
+      rate_limit: {
+        primary_window: { used_percent: 38, reset_at: 1762485600 },
+        secondary_window: { used_percent: 15, reset_at: 1763074800 },
+      },
+    };
+    const cfgD = {
+      settings: { quotaFloorPct: 2, amplePct: 25, preservePct: 30 }, rules: [],
+      upstreams: [{ id: 'codex-plan', kind: 'passthrough', tier: 'subscription', baseUrl: 'https://chatgpt.com/backend-api/codex/responses', model: 'gpt-6-luna', models: [{ id: 'gpt-6-luna', capability: 'standard' }], label: 'Codex', quotaSource: 'codex-usage', quota: { source: 'unavailable' }, enabled: true }],
+    };
+    const regD = upModQ.default.createRegistry(cfgD);
+    const svcD = quotaMod.default.createQuotaService({ config: cfgD, registry: regD, logFile: path.join(coreDir, 'routing-none.jsonl'), codexHttpGet: async () => ({ status: 200, body: JSON.stringify(USAGE_BODY) }), codexAuthPath: authFile });
+    await svcD.refreshCodexUsage();
+    const dashD = dashMod.default.createDashboard({ config: cfgD, registry: regD, quotaService: svcD, logFile: path.join(coreDir, 'routing-none.jsonl'), feedbackFile: path.join(coreDir, 'feedback-none.jsonl') });
+    const stD = dashD.buildStatus();
+    check('one quota card for the codex-usage upstream', stD.quotas.length === 1 && stD.quotas[0].id === 'codex-plan' && stD.quotas[0].name === 'Codex', JSON.stringify(stD.quotas));
+    check('card source is codex-usage and NOT flagged estimate', stD.quotas[0].source === 'codex-usage' && stD.quotas[0].estimate === false, JSON.stringify(stD.quotas[0]));
+    check('card headline is the tighter window (62%)', stD.quotas[0].remainingPct === 62, String(stD.quotas[0].remainingPct));
+    check('card carries both windows', Boolean(stD.quotas[0].windows) && stD.quotas[0].windows.primary.remainingPct === 62 && stD.quotas[0].windows.secondary.remainingPct === 85, JSON.stringify(stD.quotas[0].windows));
+    check('two-window human line in the card', stD.quotas[0].detail === '5 小时内还剩 62%，这周还剩 85%', String(stD.quotas[0].detail));
+  }
 } catch (err) {
   failed++;
   console.log('FATAL', err && err.stack || err);
