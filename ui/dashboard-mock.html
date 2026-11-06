@@ -7,58 +7,90 @@
 <title>Relay — 仪表盘（设计稿）</title>
 <style>
   :root{
-    --bg:#f5f5f7;
-    --card:#ffffff;
+    --bg:#f2f3f7;
     --ink:#1d1d1f;
-    --sub:#6e6e73;
-    --faint:#86868b;
+    --sub:#5f5f63;
+    --faint:#76767c;
     --hair:rgba(0,0,0,.07);
     --blue:#0071e3;
     --green:#34c759;
     --orange:#ff9500;
-    --track:#e8e8ed;
+    --track:rgba(120,120,128,.16);
+    --glass:rgba(255,255,255,.55);
+    --glass-line:rgba(255,255,255,.65);
+    --shadow:0 2px 6px rgba(0,0,0,.04),0 14px 34px rgba(0,0,0,.06),inset 0 1px 0 rgba(255,255,255,.8);
+    --shadow-hover:0 4px 10px rgba(0,0,0,.05),0 20px 44px rgba(0,0,0,.09),inset 0 1px 0 rgba(255,255,255,.8);
+    --ease:cubic-bezier(0.22,1,0.36,1);
     --sans:-apple-system,BlinkMacSystemFont,'SF Pro Text','PingFang SC','Helvetica Neue',Helvetica,Arial,sans-serif;
   }
   *{box-sizing:border-box}
   html{-webkit-font-smoothing:antialiased}
   body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.7 var(--sans)}
+
+  /* 柔和壁纸底：给玻璃提供可折射的内容，固定铺满、极缓慢漂移 */
+  .wallpaper{position:fixed;inset:-6%;z-index:-1;pointer-events:none;
+    background:
+      radial-gradient(620px 420px at 12% 8%,  rgba(158,196,255,.38), rgba(158,196,255,0) 62%),
+      radial-gradient(720px 500px at 88% 12%, rgba(228,186,255,.32), rgba(228,186,255,0) 62%),
+      radial-gradient(820px 620px at 50% 96%, rgba(255,203,168,.30), rgba(255,203,168,0) 62%),
+      radial-gradient(520px 420px at 82% 72%, rgba(178,233,214,.24), rgba(178,233,214,0) 62%),
+      radial-gradient(460px 360px at 22% 78%, rgba(255,196,214,.22), rgba(255,196,214,0) 62%);
+    animation:drift 48s ease-in-out infinite alternate}
+  @keyframes drift{
+    from{transform:translate3d(-1.2%,-0.8%,0) scale(1)}
+    to  {transform:translate3d( 1.2%, 1.0%,0) scale(1.03)}
+  }
+
   .wrap{max-width:880px;margin:0 auto;padding:44px 28px 40px}
 
   header{display:flex;align-items:baseline;gap:14px;margin-bottom:30px}
   header h1{font-size:32px;line-height:1.1;font-weight:700;letter-spacing:-.02em;margin:0}
   header .sub{color:var(--sub);font-size:15px}
-  header .mock{margin-left:auto;font-size:12px;font-weight:600;color:#b34700;background:rgba(255,149,0,.12);border-radius:999px;padding:3px 12px;white-space:nowrap}
+  header .mock{margin-left:auto;font-size:12px;font-weight:600;color:#b34700;background:rgba(255,255,255,.45);border:1px solid rgba(255,255,255,.6);
+    -webkit-backdrop-filter:blur(10px) saturate(180%);backdrop-filter:blur(10px) saturate(180%);
+    border-radius:999px;padding:3px 12px;white-space:nowrap}
   .statusline{display:flex;align-items:center;gap:8px;color:var(--sub);font-size:14px;margin:-18px 0 26px}
-  .dot{width:9px;height:9px;border-radius:50%;background:var(--green);flex:none}
+  .dot{position:relative;width:9px;height:9px;border-radius:50%;background:var(--green);flex:none}
+  .dot::after{content:"";position:absolute;inset:0;border-radius:50%;background:rgba(52,199,89,.45);
+    animation:pulse 2s ease-out infinite}
+  @keyframes pulse{from{transform:scale(1);opacity:.55}to{transform:scale(2.3);opacity:0}}
+
+  /* 磨砂玻璃卡（macOS / visionOS 配方） */
+  .glass{background:var(--glass);border:1px solid var(--glass-line);border-radius:20px;box-shadow:var(--shadow);
+    -webkit-backdrop-filter:blur(22px) saturate(180%);backdrop-filter:blur(22px) saturate(180%)}
+
+  /* 入场：依次淡入 + 轻微上移，无弹跳、无过冲 */
+  @keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+  .rise{animation:rise .85s var(--ease) backwards;animation-delay:var(--d,0s)}
 
   .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-bottom:20px}
-  .card{background:var(--card);border-radius:20px;padding:24px 26px;
-    box-shadow:0 1px 2px rgba(0,0,0,.03),0 10px 30px rgba(0,0,0,.04)}
+  .card{padding:24px 26px;transition:transform .3s ease,box-shadow .3s ease}
+  .card:hover{transform:translateY(-2px);box-shadow:var(--shadow-hover)}
   .card h3{margin:0 0 12px;font-size:15px;font-weight:600;color:var(--sub)}
   .big{font-size:42px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1.05}
   .big .unit{font-size:22px;font-weight:600;color:var(--sub)}
   .bar{height:7px;background:var(--track);border-radius:4px;margin:16px 0 12px;overflow:hidden}
-  .bar i{display:block;height:100%;background:var(--blue);border-radius:4px}
+  .bar i{display:block;height:100%;width:0;background:var(--blue);border-radius:4px;
+    animation:grow .9s var(--ease) .2s forwards}
+  @keyframes grow{from{width:0}to{width:var(--w)}}
   .hint{color:var(--sub);font-size:14px;line-height:1.6}
-  .tag{display:inline-block;border-radius:999px;padding:1px 10px;font-size:12px;font-weight:600;color:#b34700;background:rgba(255,149,0,.12);margin-left:8px;vertical-align:5px}
+  .tag{display:inline-block;border-radius:999px;padding:1px 10px;font-size:12px;font-weight:600;color:#b34700;background:rgba(255,149,0,.14);border:1px solid rgba(255,255,255,.5);margin-left:8px;vertical-align:5px}
 
-  .summary{background:var(--card);border-radius:20px;padding:22px 26px;margin-bottom:20px;
-    box-shadow:0 1px 2px rgba(0,0,0,.03),0 10px 30px rgba(0,0,0,.04)}
+  .summary{padding:22px 26px;margin-bottom:20px}
   .summary p{margin:0;font-size:18px}
   .summary b{font-weight:700}
 
-  section{background:var(--card);border-radius:20px;padding:24px 26px;margin-bottom:20px;
-    box-shadow:0 1px 2px rgba(0,0,0,.03),0 10px 30px rgba(0,0,0,.04)}
+  section{padding:24px 26px;margin-bottom:20px}
   section h2{margin:0 0 8px;font-size:19px;font-weight:600;letter-spacing:-.01em}
   .item{display:flex;gap:16px;align-items:baseline;padding:13px 0;border-bottom:1px solid var(--hair)}
   .item:last-child{border-bottom:none;padding-bottom:2px}
   .item .time{color:var(--faint);font-size:14px;font-variant-numeric:tabular-nums;flex:none;width:52px}
   .item .main{flex:1;min-width:0}
   .item .model{font-weight:600;font-size:16px}
-  .badge{display:inline-block;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:600;margin-left:8px;vertical-align:2px}
-  .badge.easy{color:var(--sub);background:var(--bg)}
-  .badge.normal{color:#0057b8;background:rgba(0,113,227,.09)}
-  .badge.hard{color:#b34700;background:rgba(255,149,0,.13)}
+  .badge{display:inline-block;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:600;margin-left:8px;vertical-align:2px;border:1px solid rgba(255,255,255,.5)}
+  .badge.easy{color:var(--sub);background:rgba(255,255,255,.5)}
+  .badge.normal{color:#0057b8;background:rgba(0,113,227,.10)}
+  .badge.hard{color:#b34700;background:rgba(255,149,0,.14)}
   .item .why{color:var(--sub);font-size:14.5px;line-height:1.55}
   .item .cost{flex:none;font-weight:600;font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap}
   .item .cost.quota{color:var(--sub);font-weight:500}
@@ -67,9 +99,23 @@
   .strategy b{color:var(--ink);font-weight:600}
   footer{color:var(--faint);font-size:13px;padding:10px 6px 0}
   @media (max-width:760px){ .cards{grid-template-columns:1fr} }
+
+  /* 不支持 backdrop-filter 时回退到近实色，照样干净可用 */
+  @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+    .glass{background:rgba(255,255,255,.92)}
+    header .mock{background:rgba(255,244,230,.92)}
+    .badge.easy{background:rgba(245,245,247,.92)}
+  }
+
+  /* 系统开启「减少动态」时：全部动画禁用，直接呈现终态 */
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+    .bar i{width:var(--w)}
+  }
 </style>
 </head>
 <body>
+<div class="wallpaper" aria-hidden="true"></div>
 <div class="wrap">
   <header>
     <h1>Relay</h1>
@@ -80,34 +126,34 @@
 
   <!-- 区块 1：还剩多少 / 花了多少 -->
   <div class="cards">
-    <div class="card">
+    <div class="card glass rise" style="--d:.05s">
       <h3>Codex 剩余额度</h3>
-      <div class="big">62<span class="unit">%</span></div>
-      <div class="bar"><i style="width:62%"></i></div>
+      <div class="big"><span class="num" data-count="62">62</span><span class="unit">%</span></div>
+      <div class="bar"><i style="--w:62%"></i></div>
       <div class="hint">下午 2:24 恢复满格</div>
     </div>
-    <div class="card">
+    <div class="card glass rise" style="--d:.13s">
       <h3>Gemini 剩余额度</h3>
-      <div class="big">74<span class="unit">%</span><span class="tag">估算</span></div>
-      <div class="bar"><i style="width:74%;background:var(--orange)"></i></div>
+      <div class="big"><span class="num" data-count="74">74</span><span class="unit">%</span><span class="tag">估算</span></div>
+      <div class="bar"><i style="--w:74%;background:var(--orange)"></i></div>
       <div class="hint">够用，不用省着</div>
     </div>
-    <div class="card">
+    <div class="card glass rise" style="--d:.21s">
       <h3>API 今天已花费</h3>
-      <div class="big"><span class="unit">¥</span>1.32</div>
+      <div class="big"><span class="unit">¥</span><span class="num" data-count="1.32" data-dec="2">1.32</span></div>
       <div class="hint" style="margin-top:16px">大部分时候用的是订阅额度，没花钱</div>
     </div>
   </div>
 
   <!-- 区块 2：今日小结 -->
-  <div class="summary">
+  <div class="summary glass rise" style="--d:.30s">
     <p>今天一共用了 <b>23 次</b>，其中 19 次走订阅额度没花钱，帮你省下约 <b>¥12</b>（估算）。</p>
   </div>
 
   <!-- 区块 3：最近动态 -->
-  <section>
+  <section class="glass rise" style="--d:.38s">
     <h2>最近动态</h2>
-    <div class="item">
+    <div class="item rise" style="--d:.46s">
       <span class="time">13:02</span>
       <div class="main">
         <span class="model">GPT-6 Luna</span><span class="badge normal">普通</span>
@@ -115,7 +161,7 @@
       </div>
       <span class="cost quota">用额度</span>
     </div>
-    <div class="item">
+    <div class="item rise" style="--d:.53s">
       <span class="time">12:58</span>
       <div class="main">
         <span class="model">DeepSeek Lite</span><span class="badge easy">简单</span>
@@ -123,7 +169,7 @@
       </div>
       <span class="cost">¥0.01</span>
     </div>
-    <div class="item">
+    <div class="item rise" style="--d:.60s">
       <span class="time">12:41</span>
       <div class="main">
         <span class="model">GPT-6 Sol</span><span class="badge hard">复杂</span>
@@ -131,7 +177,7 @@
       </div>
       <span class="cost quota">用额度</span>
     </div>
-    <div class="item">
+    <div class="item rise" style="--d:.67s">
       <span class="time">12:20</span>
       <div class="main">
         <span class="model">DeepSeek Chat</span><span class="badge normal">普通</span>
@@ -139,7 +185,7 @@
       </div>
       <span class="cost">¥0.05</span>
     </div>
-    <div class="item">
+    <div class="item rise" style="--d:.74s">
       <span class="time">11:57</span>
       <div class="main">
         <span class="model">Gemini 3.1 Pro</span><span class="badge hard">复杂</span>
@@ -147,7 +193,7 @@
       </div>
       <span class="cost quota">用额度</span>
     </div>
-    <div class="item">
+    <div class="item rise" style="--d:.81s">
       <span class="time">11:32</span>
       <div class="main">
         <span class="model">GPT-6 Luna</span><span class="badge easy">简单</span>
@@ -164,5 +210,25 @@
 
   <footer>这是设计稿，数字都是举例。正式版会换成你的真实数据。</footer>
 </div>
+<script>
+  // 大数字滚动：从 0 到目标值，约 900ms，easeOut，一次性；系统减少动态时不跑、直接显示终值
+  (function(){
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    var ease = function(t){ return 1 - Math.pow(1 - t, 3); };
+    document.querySelectorAll('.num[data-count]').forEach(function(el){
+      var target = parseFloat(el.getAttribute('data-count'));
+      var dec = parseInt(el.getAttribute('data-dec') || '0', 10);
+      var dur = 900, start = null;
+      el.textContent = (0).toFixed(dec);
+      function frame(ts){
+        if (!start) start = ts;
+        var p = Math.min((ts - start) / dur, 1);
+        el.textContent = (target * ease(p)).toFixed(dec);
+        if (p < 1) requestAnimationFrame(frame);
+      }
+      setTimeout(function(){ requestAnimationFrame(frame); }, 200);
+    });
+  })();
+</script>
 </body>
 </html>
