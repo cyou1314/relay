@@ -1,0 +1,31 @@
+# dependencies & build
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# local config & credentials — never commit
+.env
+.env.*
+!.env.example
+config.local.*
+*.local.json
+auth.json
+credentials*
+*secret*
+*.pem
+*.key
+
+# runtime data
+*.sqlite
+*.sqlite-journal
+*.db
+logs/
+data/
+*.log
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
