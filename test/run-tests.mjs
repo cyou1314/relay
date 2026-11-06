@@ -668,6 +668,151 @@ try {
     check('500 plain -> error (unchanged)', cf({ status: 500, code: 'mock_internal', type: 'server_error', message: 'mock internal error' }) === 'error');
     check('fallbackReasonCode: auth -> fallback_auth, old kinds unchanged', frc('auth') === 'fallback_auth' && frc('quota') === 'fallback_quota' && frc('filtered') === 'fallback_filtered' && frc('error') === 'fallback_error');
   }
+
+  // =======================================================================
+  // Dashboard (M4 wiring): GET / + /dashboard serve the approved design
+  // bound to real data; GET /api/status assembles quotas (quota.js),
+  // today's ledger slice and the newest log lines — with every reason
+  // code translated to plain language server-side.
+  // =======================================================================
+  console.log('test 34: dashboard endpoints — status numbers reconcile with live traffic');
+  {
+    const dashQuota = path.join(coreDir, 'quota-dash.json');
+    fs.writeFileSync(dashQuota, JSON.stringify({ 'sub-main': { remainingPct: 62, resetsAt: '2026-11-06T14:24:00.000Z' } }));
+    const subDash = { ...subUp(SUB_PORT), quota: { source: 'mock', mockFile: dashQuota }, label: 'Codex' };
+    const gemUp = { id: 'gem-meter', kind: 'chat', tier: 'subscription', baseUrl: `http://127.0.0.1:${SUB_PORT}/v1`, model: 'gem-model', models: ['gem-model'], label: 'Gemini', quota: { source: 'metering', windowTokens: 150 } };
+    const logE = path.join(coreDir, 'routing-e.jsonl');
+    const cfgE = writeCfg('config-e.json', [subDash, gemUp, cheapUp(CHEAP_PORT)],
+      [{ cwdPrefix: '/work/gem-proj', upstream: 'gem-meter' }, { cwdPrefix: '/work/cheap-proj', upstream: 'cheap-api' }]);
+    start(['src/gateway.js'], { RELAY_PORT: '18973', RELAY_CONFIG: cfgE, RELAY_LOG_FILE: logE, RELAY_FEEDBACK_FILE: feedbackFile, RELAY_USD_CNY: '7' });
+    await waitHealth('http://127.0.0.1:18973/health');
+    const E = 'http://127.0.0.1:18973';
+    await routedPost(E, { model: 'mock-model', input: 'say hello', stream: false });
+    await routedPost(E, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/gem-proj' });
+    await routedPost(E, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/cheap-proj' });
+    const stResp = await fetch(`${E}/api/status`);
+    check('status endpoint 200 + JSON', stResp.status === 200 && (stResp.headers.get('content-type') || '').includes('application/json'), `got ${stResp.status}`);
+    const st = await stResp.json();
+    check('not empty after traffic', st.empty === false);
+    check('quota card 1: mock source, 62%, not an estimate', st.quotas.length === 2 && st.quotas[0].id === 'sub-main' && st.quotas[0].remainingPct === 62 && st.quotas[0].source === 'mock' && st.quotas[0].estimate === false && st.quotas[0].name === 'Codex', JSON.stringify(st.quotas));
+    check('quota card 2: metering 15/150 used -> 90%, flagged estimate', st.quotas[1].id === 'gem-meter' && st.quotas[1].remainingPct === 90 && st.quotas[1].source === 'metering-estimate' && st.quotas[1].estimate === true, JSON.stringify(st.quotas[1]));
+    check('today: 3 served, 2 on subscription', st.today.served === 3 && st.today.subscriptionServed === 2, JSON.stringify(st.today));
+    check('today: cash reconciles (one cheap request = $0.00004)', Math.abs(st.today.cashUsd - 0.00004) < 1e-12, String(st.today.cashUsd));
+    check('today: CNY is display conversion at the configured rate 7', st.usdCnyRate === 7 && Math.abs(st.today.cashCny - 0.00028) < 1e-12, JSON.stringify(st.today));
+    check('recent: 3 items, newest first is the cheap pin', st.recent.length === 3 && st.recent[0].model === 'cheap-model' && st.recent[0].cost.kind === 'money' && Math.abs(st.recent[0].cost.usd - 0.00004) < 1e-12, JSON.stringify(st.recent[0]));
+    check('recent: pin reason in plain words', st.recent[0].why === '你给这个项目指定用的就是这家', st.recent[0].why);
+    check('recent: difficulty badge in plain words (light -> 简单)', st.recent[0].badge && st.recent[0].badge.text === '简单' && st.recent[0].badge.key === 'easy', JSON.stringify(st.recent[0].badge));
+    check('recent: subscription items cost 用额度 + initial reason in plain words', st.recent[2].cost.kind === 'quota' && st.recent[2].cost.text === '用额度' && st.recent[2].why === '额度够，先用订阅的', JSON.stringify(st.recent[2]));
+    check('recent: no raw reason codes anywhere in the payload', !/fallback_|sticky_session|difficulty_|reasonCode/.test(JSON.stringify(st.recent)), JSON.stringify(st.recent).slice(0, 200));
+    check('strategy sentence uses the live preserve threshold (30%)', st.strategy.includes('低于 30%') && st.strategy.includes('先用快要到期的订阅额度'), st.strategy);
+
+    const htmlResp = await fetch(`${E}/dashboard`);
+    const html = await htmlResp.text();
+    check('GET /dashboard 200 text/html', htmlResp.status === 200 && (htmlResp.headers.get('content-type') || '').includes('text/html'), `got ${htmlResp.status}`);
+    check('page has the four blocks', html.includes('最近动态') && html.includes('剩余额度') && html.includes('现在的做法') && html.includes('API 今天已花费'), '');
+    check('page fetches /api/status and refreshes every 15s', html.includes('/api/status') && html.includes('15000'), '');
+    check('page carries the friendly empty-state sentence', html.includes('还没有记录'), '');
+    check('page has NO particle layer (no canvas anywhere)', !/canvas/i.test(html), '');
+    check('page has no fixture numbers or design-mock label', !html.includes('data-count="62"') && !html.includes('1.32') && !html.includes('设计稿'), '');
+    check('page contains no raw reason codes', !html.includes('reasonCode') && !/fallback_|sticky_session/.test(html), '');
+    const rootHtml = await (await fetch(`${E}/`)).text();
+    check('GET / serves the same dashboard', rootHtml.includes('最近动态') && rootHtml.includes('/api/status'), '');
+  }
+
+  console.log('test 35: /api/status builder — fixture log reconciles; every reason code has a human sentence');
+  {
+    const dashMod = await import('file://' + path.join(root, 'src/dashboard.js'));
+    const upMod = await import('file://' + path.join(root, 'src/upstreams.js'));
+    const quotaMod = await import('file://' + path.join(root, 'src/quota.js'));
+    const { createDashboard, humanWhy, REASON_WHY, FALLBACK_WHY } = dashMod.default;
+    const fxQuota = path.join(coreDir, 'quota-fx.json');
+    fs.writeFileSync(fxQuota, JSON.stringify({ 'sub-main': { remainingPct: 62, resetsAt: '2026-11-06T14:24:00.000Z' } }));
+    const fxUp = (id, tier, price, quota, label) => ({ id, kind: 'chat', tier, baseUrl: 'http://127.0.0.1:1/v1', model: id + '-model', models: [{ id: id + '-model', capability: 'standard' }], price, quota, enabled: true, ...(label ? { label } : {}) });
+    const fxConfig = {
+      settings: { quotaFloorPct: 2, amplePct: 25, preservePct: 30 }, rules: [],
+      upstreams: [
+        { ...fxUp('sub-main', 'subscription', { inputPer1k: 0, outputPer1k: 0 }, { source: 'mock', mockFile: fxQuota }, 'Codex'), model: 'sub-model', models: [{ id: 'sub-model', capability: 'standard' }] },
+        { ...fxUp('cheap-api', 'cheap-api', PRICES.cheap, { source: 'unavailable' }), model: 'cheap-model', models: [{ id: 'cheap-model', capability: 'standard' }] },
+        { ...fxUp('premium-api', 'premium-api', PRICES.premium, { source: 'unavailable' }), model: 'premium-model', models: [{ id: 'premium-model', capability: 'heavy' }] },
+      ],
+    };
+    const fxLog = path.join(coreDir, 'routing-fx.jsonl');
+    const U = (i, o) => ({ input_tokens: i, output_tokens: o, total_tokens: i + o });
+    const fxLine = (mins, f) => JSON.stringify({ ts: new Date(Date.now() - mins * 60000).toISOString(), path: '/v1/responses', mode: 'routed', attempt: 1, difficulty: { level: 'standard', score: 1, signals: [] }, ...f });
+    const fxLines = [
+      fxLine(12, { upstream: 'sub-main', chosen: 'sub-main', status: 200, reasonCode: 'initial', usage: U(10, 5), servedModel: 'sub-model' }),
+      fxLine(11, { upstream: 'premium-api', chosen: 'premium-api', status: 200, reasonCode: 'pinned', usage: U(30, 15), servedModel: 'premium-model' }),
+      fxLine(10, { upstream: 'sub-main', chosen: 'sub-main', status: 200, reasonCode: 'sticky_session', usage: U(10, 5), servedModel: 'sub-model', difficulty: { level: 'light', score: 0, signals: [] } }),
+      fxLine(9, { upstream: 'cheap-api', chosen: 'cheap-api', status: 200, reasonCode: 'fallback_quota', usage: U(20, 10), servedModel: 'cheap-model' }),
+      fxLine(8, { upstream: 'cheap-api', chosen: 'cheap-api', status: 200, reasonCode: 'fallback_filtered', usage: U(20, 10), servedModel: 'cheap-model', difficulty: { level: 'heavy', score: 5, signals: [] } }),
+      fxLine(7, { upstream: 'cheap-api', chosen: 'cheap-api', status: 200, reasonCode: 'fallback_auth', usage: U(20, 10), servedModel: 'cheap-model' }),
+      fxLine(6, { upstream: 'premium-api', chosen: 'premium-api', status: 200, reasonCode: 'fallback_error', usage: U(30, 15), servedModel: 'premium-model' }),
+      fxLine(5, { upstream: 'cheap-api', chosen: 'cheap-api', status: 200, reasonCode: 'difficulty_light_preserve', usage: U(20, 10), servedModel: 'cheap-model', difficulty: { level: 'light', score: 0, signals: [] } }),
+      fxLine(4, { upstream: 'sub-main', chosen: 'sub-main', status: 200, reasonCode: 'difficulty_upgrade', usage: U(10, 5), servedModel: 'sub-model', difficulty: { level: 'heavy', score: 5, signals: [] } }),
+      fxLine(3, { upstream: 'sub-main', chosen: 'sub-main', status: 200, reasonCode: 'difficulty_underpowered', usage: U(10, 5), servedModel: 'sub-model', difficulty: { level: 'heavy', score: 5, signals: [] } }),
+      fxLine(2, { upstream: null, chosen: null, status: 403, reasonCode: 'sensitive_block', servedModel: null }),
+      fxLine(1, { upstream: 'sub-main', chosen: 'sub-main', status: 400, reasonCode: 'invalid_request_stop', error: 'context_length_exceeded', servedModel: 'sub-model' }),
+    ];
+    fs.writeFileSync(fxLog, fxLines.join('\n') + '\n');
+    const fxRegistry = upMod.default.createRegistry(fxConfig);
+    const fxQuotaSvc = quotaMod.default.createQuotaService({ config: fxConfig, registry: fxRegistry, logFile: fxLog });
+    const fxDash = createDashboard({ config: fxConfig, registry: fxRegistry, quotaService: fxQuotaSvc, logFile: fxLog, feedbackFile: path.join(coreDir, 'feedback-fx.jsonl') });
+    const fx = fxDash.buildStatus();
+    // Independent recomputation from the fixture lines + price table.
+    let expServed = 0, expSub = 0, expCash = 0;
+    const priceMap = { 'cheap-api': PRICES.cheap, 'premium-api': PRICES.premium };
+    const tierMap = { 'sub-main': 'subscription', 'cheap-api': 'cheap-api', 'premium-api': 'premium-api' };
+    for (const l of fxLines) {
+      const e = JSON.parse(l);
+      if (!(e.status >= 200 && e.status < 300 && e.usage)) continue;
+      expServed++;
+      if (tierMap[e.upstream] === 'subscription') expSub++;
+      else expCash += (e.usage.input_tokens / 1000) * priceMap[e.upstream].inputPer1k + (e.usage.output_tokens / 1000) * priceMap[e.upstream].outputPer1k;
+    }
+    check('fixture: today served/subscription counts reconcile', fx.today.served === expServed && fx.today.subscriptionServed === expSub && expServed === 10 && expSub === 4, JSON.stringify(fx.today));
+    check('fixture: today cash reconciles to <1e-9', Math.abs(fx.today.cashUsd - expCash) < 1e-9 && Math.abs(expCash - 0.00136) < 1e-12, `${fx.today.cashUsd} vs ${expCash}`);
+    check('fixture: default CNY rate 7.2 applied to display value only', fx.usdCnyRate === 7.2 && Math.abs(fx.today.cashCny - expCash * 7.2) < 1e-9, JSON.stringify(fx.today));
+    check('fixture: quota card from mock source with label name', fx.quotas.length === 1 && fx.quotas[0].remainingPct === 62 && fx.quotas[0].source === 'mock' && fx.quotas[0].estimate === false && fx.quotas[0].name === 'Codex', JSON.stringify(fx.quotas));
+    check('fixture: not empty', fx.empty === false);
+    const whyAt = (i) => fx.recent[i] && fx.recent[i].why;
+    check('fixture: recent capped at 10, newest first', fx.recent.length === 10 && fx.recent[0].model === 'sub-model', `got ${fx.recent.length}`);
+    check('recent why: invalid_request_stop', whyAt(0) === '这次的内容太长了，哪家都处理不了' && fx.recent[0].cost.kind === 'none', whyAt(0));
+    check('recent why: sensitive_block', whyAt(1) === '这个项目被你标了机密，又没有订阅可用，按规矩拦下了', whyAt(1));
+    check('recent why: difficulty_underpowered + 复杂 badge', whyAt(2) === '任务复杂，但没有更强的可用，先用这家顶上' && fx.recent[2].badge.text === '复杂', whyAt(2));
+    check('recent why: difficulty_upgrade', whyAt(3) === '任务变复杂了，换了更强的', whyAt(3));
+    check('recent why: difficulty_light_preserve + 简单 badge', whyAt(4) === '任务简单，订阅额度又剩得不多，先用便宜的，把额度留给复杂任务' && fx.recent[4].badge.text === '简单', whyAt(4));
+    check('recent why: fallback_error + money cost', whyAt(5) === '刚才那家出故障了，自动换了一家' && fx.recent[5].cost.kind === 'money', whyAt(5));
+    check('recent why: fallback_auth', whyAt(6) === '前面那家登录失效了，自动换了这家', whyAt(6));
+    check('recent why: fallback_filtered', whyAt(7) === '前面那家把内容拦下了，自动换了这家', whyAt(7));
+    check('recent why: fallback_quota', whyAt(8) === '前面那家额度用完了，自动换了这家', whyAt(8));
+    check('recent why: sticky_session + quota cost', whyAt(9) === '接着前面的对话，还用这家' && fx.recent[9].cost.text === '用额度', whyAt(9));
+
+    // Coverage sweep: EVERY routed reason code must own a plain
+    // sentence (traverse-and-assert, so a future code cannot slip
+    // through untranslated); unknown codes degrade to the generic one.
+    const EXPECTED_CODES = ['initial', 'pinned', 'sticky_session', 'fallback_quota', 'fallback_filtered', 'fallback_auth', 'fallback_error', 'invalid_request_stop', 'sensitive_block', 'difficulty_light_preserve', 'difficulty_upgrade', 'difficulty_underpowered', 'client_abort', 'upstream_error', 'passthrough_default', 'translate_default'];
+    for (const code of EXPECTED_CODES) {
+      const why = humanWhy({ status: 200, reasonCode: code }, 'subscription');
+      check(`humanWhy covers ${code}`, typeof why === 'string' && why.length > 0 && why !== code && why !== FALLBACK_WHY, String(why));
+      if (code !== 'initial') check(`REASON_WHY owns ${code}`, Object.prototype.hasOwnProperty.call(REASON_WHY, code), '');
+    }
+    check('humanWhy: unknown code falls back to the generic sentence', humanWhy({ status: 200, reasonCode: 'some_future_code' }, 'subscription') === FALLBACK_WHY);
+    check('humanWhy: initial is tier-aware', humanWhy({ status: 200, reasonCode: 'initial' }, 'subscription') !== humanWhy({ status: 200, reasonCode: 'initial' }, 'cheap-api'));
+    check('humanWhy: failed attempts explain the failure (429/401/500)', humanWhy({ status: 429, reasonCode: 'initial' }, 'subscription') === '这家额度用完了，没办成' && humanWhy({ status: 401, reasonCode: 'initial' }, 'cheap-api') === '这家登录失效了，没办成' && humanWhy({ status: 500, reasonCode: 'initial' }, 'cheap-api') === '这家出故障了，没办成');
+  }
+
+  console.log('test 36: dashboard empty state — fresh log, friendly zeros, no fake numbers');
+  {
+    const logF = path.join(coreDir, 'routing-f.jsonl'); // never created
+    const cfgF = writeCfg('config-f.json', [subUp(SUB_PORT), cheapUp(CHEAP_PORT)], []);
+    const F = await startRouted(18974, cfgF, logF);
+    const st = await (await fetch(`${F}/api/status`)).json();
+    check('empty flag true with no log file', st.empty === true, JSON.stringify(st).slice(0, 160));
+    check('recent is an empty list', Array.isArray(st.recent) && st.recent.length === 0);
+    check('today is honest zeros', st.today.served === 0 && st.today.subscriptionServed === 0 && st.today.cashUsd === 0 && st.today.cashCny === 0, JSON.stringify(st.today));
+    const html = await (await fetch(`${F}/dashboard`)).text();
+    check('page still carries the friendly empty-state sentence', html.includes('还没有记录，等你用 Codex 干活后'), '');
+  }
 } catch (err) {
   failed++;
   console.log('FATAL', err && err.stack || err);

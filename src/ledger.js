@@ -43,7 +43,7 @@ function emptyBucket() {
   return { requests: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 }
 
-function summarize({ config, logFile, feedbackFile }) {
+function summarize({ config, logFile, feedbackFile, fromTs = null, toTs = null }) {
   const registry = config ? createRegistry(config) : null;
   const quotaService = config ? createQuotaService({ config, registry, logFile }) : null;
   const lines = readLines(logFile);
@@ -55,6 +55,11 @@ function summarize({ config, logFile, feedbackFile }) {
 
   for (const e of lines) {
     if (e.path !== '/v1/responses') continue;
+    // Optional time window (ISO strings; lexicographic compare is exact
+    // for the ISO-Z timestamps the gateway writes). The dashboard uses
+    // it for the "today" slice; the CLI leaves it unset (all time).
+    if (fromTs && !(e.ts && e.ts >= fromTs)) continue;
+    if (toTs && !(e.ts && e.ts < toTs)) continue;
     const ok = e.status >= 200 && e.status < 300 && e.usage;
     if (!ok) { if (e.status) attemptsFailed++; continue; }
     served++;

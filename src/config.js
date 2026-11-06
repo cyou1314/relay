@@ -56,6 +56,9 @@ function normalizeUpstream(raw, idx) {
   const price = raw.price || {};
   return {
     id: raw.id,
+    // Optional human display name for the dashboard (e.g. "Codex");
+    // falls back to a prettified id when absent.
+    label: typeof raw.label === 'string' ? raw.label : null,
     kind,
     tier,
     // chat kind: base URL of an OpenAI-compatible /v1 root.

@@ -78,6 +78,13 @@
  * POST /v1/feedback {requestId, verdict:"up"|"down"} appends to the
  * feedback log (RELAY_FEEDBACK_FILE, default <repo>/logs/feedback.jsonl).
  * Record + count only (see src/ledger.js); no automatic tuning yet.
+ *
+ * Dashboard (src/dashboard.js): GET / and GET /dashboard serve the live
+ * page (the approved mock's design bound to real data); GET /api/status
+ * returns quotas (src/quota.js, source + estimate flags), today's
+ * ledger slice and the newest routing-log lines — with every reason
+ * code translated to plain language server-side, so the page never
+ * shows a raw code or a token count.
  */
 const http = require('node:http');
 const https = require('node:https');
@@ -89,6 +96,7 @@ const { createRegistry, resolveTarget, classifyFailure, fallbackReasonCode } = r
 const { createQuotaService } = require('./quota');
 const routerEngine = require('./router');
 const difficultyEngine = require('./difficulty');
+const { createDashboard } = require('./dashboard');
 
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.RELAY_PORT || 18923);
@@ -111,6 +119,16 @@ try { CONFIG = loadConfig(); } catch (err) {
 }
 const registry = CONFIG ? createRegistry(CONFIG) : null;
 const quotaService = CONFIG ? createQuotaService({ config: CONFIG, registry, logFile: LOG_FILE }) : null;
+// Live dashboard (read-only): GET / + /dashboard serve the page,
+// GET /api/status serves the JSON. Works in legacy mode too (no
+// registry -> no quota cards; the log still drives today + recent).
+// RELAY_USD_CNY is a DISPLAY-only conversion rate for the page's ¥
+// figures (default 7.2); the ledger itself stays in USD.
+const dashboard = createDashboard({
+  config: CONFIG, registry, quotaService,
+  logFile: LOG_FILE, feedbackFile: FEEDBACK_FILE,
+  usdCny: Number(process.env.RELAY_USD_CNY || 7.2),
+});
 
 let logDirReady = false;
 function logRoute(entry) {
@@ -935,6 +953,8 @@ const server = http.createServer(async (req, res) => {
   const startedAt = Date.now();
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   if (req.method === 'GET' && url.pathname === '/health') { sendJson(res, 200, { ok: true, mode: CONFIG ? 'routed' : MODE, routed: Boolean(CONFIG), upstreams: CONFIG ? registry.enabled().length : null }); return; }
+  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) { dashboard.handleHtml(req, res); return; }
+  if (req.method === 'GET' && url.pathname === '/api/status') { dashboard.handleStatus(req, res); return; }
   if (req.method === 'GET' && url.pathname === '/v1/models') { await handleModels(req, res, url, startedAt); return; }
   if (req.method === 'POST' && url.pathname === '/v1/feedback') {
     const rawBody = await readBody(req);
