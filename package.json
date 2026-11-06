@@ -1,0 +1,1 @@
+{"description":"Local-first model router for AI coding agents (M0 spike)","engines":{"node":">=18"},"name":"relay","private":true,"scripts":{"mock":"node test/mock-upstream.js","start":"node src/gateway.js","test":"node test/run-tests.mjs"},"version":"0.0.1"}
