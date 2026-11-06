@@ -1,5 +1,8 @@
 # Relay Mac 真机部署清单（DEPLOY-MAC）
 
+> **Mac 环境注意（2026-11-06 真机部署确认）**：这台 Mac 上 Codex 会话的 shell PATH 不含 `/Users/cyou/node/bin`，下文凡跑 node/npm 的命令一律前加 `PATH=/Users/cyou/node/bin:$PATH`（每条命令单独加）；`codex exec` 必须在受信任目录内运行（用 `~/relay` 本身即可，/tmp 会被 Codex 信任检查拒绝）；路由日志核对字段是 `upstream`/`chosen`（订阅上游 id 为 `codex-plan`），没有 provider 字段。
+
+
 执行者：在主人 Mac 上干活的 Codex。照步骤编号顺序执行，**每一步先跑验证命令、对照预期输出，确认无误才进下一步**。任何一步输出与预期不符：**立即停手**，把该步的命令与完整报错原样回报主人，不许自行猜测修复、不许跳步。
 
 ## 红线（全程有效）

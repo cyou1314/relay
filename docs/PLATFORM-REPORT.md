@@ -148,3 +148,18 @@ deployment, in order:
 
 After the platform step: Gemini wiring (step 2 of the owner's order),
 then API pool keys (step 3) — each with its own report.
+
+
+## Mac 真机部署（2026-11-06，已完成）
+
+按 `deploy/DEPLOY-MAC.md` 在用户 Mac（jay的MacBook Pro）执行完毕，证据链：
+
+- Mac 本地克隆仓库，测试 **297/297** 通过（Node v26.13.0）。
+- launchd `com.muse.relay` 已加载常驻（RunAtLoad + KeepAlive），`GET /api/status` 与 `/dashboard` 均 200。
+- config-manager install 成功：真 `~/.codex/config.toml` 只新增首尾两个 Relay 托管段，备份 `~/.codex/config-before-relay.toml` 在位；status 显示 managed:true、provider:relay、baseUrl http://127.0.0.1:18923/v1。
+- 真链：在 `~/relay` 下 `codex exec` 经 Relay 回复 `relay-mac-ok`（退出码 0），证明文件一致；路由日志对应行 mode:routed、upstream/chosen:`codex-plan`、status 200、quota.source:`codex-usage`（验收脚本曾误写字段名 provider/codex-subscription，以日志原样为准）。
+- 桌面版 Codex 新对话已在 Relay 下正常工作（会话粘性 sticky_session）；旧对话打开时应用会提示「此聊天使用 openai，当前提供商是 relay」，点切换即可继续——属切换默认提供商后的预期行为，非故障。
+
+遗留小问题（已立项）：桌面版 Codex 曾报一次模型列表刷新解码失败（`failed to decode models response`，body 307 bytes），疑似桌面版对 `/v1/models` 响应格式要求比 CLI 更严；对话功能不受影响，待专项核查后修复并补测试。
+
+部署中确认的 Mac 环境事实（已同步修订 DEPLOY-MAC.md）：该机 Codex 桌面会话的 shell PATH 不含 `/Users/cyou/node/bin`，命令须带 PATH 前缀或绝对路径；`codex exec` 须在受信任目录（git 仓库）内运行，/tmp 会被信任检查拒绝。
