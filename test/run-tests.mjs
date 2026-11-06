@@ -168,6 +168,7 @@ try {
     check('contains mock-model', ids.includes('mock-model'), ids.join(','));
     check('contains mock-model-2', ids.includes('mock-model-2'), ids.join(','));
     check('entries have object=model', (json.data || []).every((m) => m.object === 'model'));
+    check('translate /v1/models also carries Codex models[]', Array.isArray(json.models) && json.models.length === ids.length && json.models.every((m) => typeof m.slug === 'string' && m.truncation_policy && Array.isArray(m.supported_reasoning_levels)), JSON.stringify(json.models && json.models[0]).slice(0, 160));
   }
 
   console.log('test 8: upstream 429 mapped to Responses error shape');
@@ -356,6 +357,13 @@ try {
     const models = await (await fetch(`${A}/v1/models`)).json();
     const ids = (models.data || []).map((m) => m.id);
     check('routed /v1/models is the registry union', ids.includes('sub-model') && ids.includes('cheap-model') && ids.includes('premium-model'), ids.join(','));
+    // Codex desktop shape: { models: [ModelInfo] } with every serde-required
+    // field present (desktop 0.167 decode failure, 2026-11-06).
+    const REQUIRED = ['slug', 'display_name', 'supported_reasoning_levels', 'shell_type', 'visibility', 'supported_in_api', 'priority', 'support_verbosity', 'truncation_policy', 'experimental_supported_tools'];
+    const infos = models.models || [];
+    check('routed /v1/models carries Codex models[] for every id', infos.length === ids.length && infos.every((m) => ids.includes(m.slug)), JSON.stringify(infos.map((m) => m.slug)));
+    check('every ModelInfo carries all serde-required fields', infos.every((m) => REQUIRED.every((k) => m[k] !== undefined && m[k] !== null)), JSON.stringify(infos[0]).slice(0, 200));
+    check('ModelInfo field shapes are parser-shaped', infos.every((m) => Array.isArray(m.supported_reasoning_levels) && m.supported_reasoning_levels.every((r) => typeof r.effort === 'string' && typeof r.description === 'string') && m.truncation_policy && typeof m.truncation_policy.limit === 'number' && Array.isArray(m.experimental_supported_tools)), JSON.stringify(infos[0]).slice(0, 200));
   }
 
   console.log('test 15: routed priority — exhausted subscription quota falls to cheap API');

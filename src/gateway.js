@@ -936,6 +936,58 @@ async function handleFeedback(req, res, rawBody) {
 // ---------------------------------------------------------------------------
 // GET /v1/models
 // ---------------------------------------------------------------------------
+// The response carries TWO shapes at once:
+//   data[]   — the OpenAI list shape (OpenAI-compatible clients, Codex CLI).
+//   models[] — the Codex backend shape ({ models: [ModelInfo] }) that the
+//              Codex desktop app's models manager deserializes. Without it
+//              the desktop fails the whole response with "failed to decode
+//              models response … missing field `models`" (observed on the
+//              Mac, desktop 0.167.0-alpha.3.2, 2026-11-06). ModelInfo's
+//              serde-required fields (openai/codex rust-v0.167.0,
+//              codex-rs/protocol/src/openai_models.rs) are: slug,
+//              display_name, supported_reasoning_levels, shell_type,
+//              visibility, supported_in_api, priority, support_verbosity,
+//              truncation_policy, experimental_supported_tools — every
+//              entry below carries all of them; the rest is defaults the
+//              parser fills in itself.
+function codexModelInfo(id, priority) {
+  return {
+    slug: id,
+    display_name: id,
+    description: null,
+    default_reasoning_level: 'medium',
+    supported_reasoning_levels: [
+      { effort: 'low', description: 'Fast responses with lighter reasoning' },
+      { effort: 'medium', description: 'Balanced reasoning' },
+      { effort: 'high', description: 'Deep reasoning for complex work' },
+      { effort: 'xhigh', description: 'Extra deep reasoning' },
+    ],
+    shell_type: 'shell_command',
+    visibility: 'list',
+    supported_in_api: true,
+    priority,
+    availability_nux: null,
+    upgrade: null,
+    support_verbosity: true,
+    default_verbosity: 'low',
+    apply_patch_tool_type: 'freeform',
+    web_search_tool_type: 'text_and_image',
+    truncation_policy: { mode: 'tokens', limit: 10000 },
+    supports_image_detail_original: true,
+    experimental_supported_tools: [],
+    input_modalities: ['text', 'image'],
+    supports_search_tool: true,
+  };
+}
+
+function modelsPayload(ids) {
+  return {
+    object: 'list',
+    data: ids.map((id) => ({ id, object: 'model', created: 0, owned_by: 'relay' })),
+    models: ids.map((id, i) => codexModelInfo(id, i + 1)),
+  };
+}
+
 async function handleModels(req, res, url, startedAt) {
   if (CONFIG) {
     // Routed mode: the model list is the union of the enabled upstreams'
@@ -945,7 +997,7 @@ async function handleModels(req, res, url, startedAt) {
       for (const m of [...u.models.map((x) => x.id), ...(u.model ? [u.model] : [])]) if (!ids.includes(m)) ids.push(m);
     }
     logRoute({ path: '/v1/models', mode: 'routed', upstream: null, model: null, authPresent: Boolean(req.headers.authorization), status: 200, reasonCode: 'initial', ms: Date.now() - startedAt });
-    sendJson(res, 200, { object: 'list', data: ids.map((id) => ({ id, object: 'model', created: 0, owned_by: 'relay' })) });
+    sendJson(res, 200, modelsPayload(ids));
     return;
   }
   if (MODE === 'passthrough') {
@@ -958,7 +1010,7 @@ async function handleModels(req, res, url, startedAt) {
   const logBase = { path: '/v1/models', mode: 'translate', upstream: UPSTREAM_BASE, model: null, authPresent: false };
   const sendList = (ids, reasonCode) => {
     logRoute({ ...logBase, status: 200, reasonCode, ms: Date.now() - startedAt });
-    sendJson(res, 200, { object: 'list', data: ids.map((id) => ({ id, object: 'model', created: 0, owned_by: 'relay' })) });
+    sendJson(res, 200, modelsPayload(ids));
   };
   if (MODELS_OVERRIDE.length) { sendList(MODELS_OVERRIDE, 'translate_default'); return; }
   try {

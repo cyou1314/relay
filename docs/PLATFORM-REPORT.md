@@ -163,3 +163,10 @@ then API pool keys (step 3) — each with its own report.
 遗留小问题（已立项）：桌面版 Codex 曾报一次模型列表刷新解码失败（`failed to decode models response`，body 307 bytes），疑似桌面版对 `/v1/models` 响应格式要求比 CLI 更严；对话功能不受影响，待专项核查后修复并补测试。
 
 部署中确认的 Mac 环境事实（已同步修订 DEPLOY-MAC.md）：该机 Codex 桌面会话的 shell PATH 不含 `/Users/cyou/node/bin`，命令须带 PATH 前缀或绝对路径；`codex exec` 须在受信任目录（git 仓库）内运行，/tmp 会被信任检查拒绝。
+
+
+### 模型列表解码问题：已修复（2026-11-06，待 Mac 更新后复验）
+
+根因确认：桌面版 Codex（0.167）的模型管理器按 Codex 后端格式解析 `/v1/models`，期望 `{models:[ModelInfo]}`；Relay 此前只返回 OpenAI 的 `{object:"list", data:[…]}`，缺 `models` 字段，serde 在正文末尾报 missing field——与实测「column 307 = 307 bytes 正文末尾」吻合。对照源码为 openai/codex `rust-v0.167.0` 的 `codex-rs/protocol/src/openai_models.rs`：ModelInfo 的必填字段共 10 个（slug、display_name、supported_reasoning_levels、shell_type、visibility、supported_in_api、priority、support_verbosity、truncation_policy、experimental_supported_tools），其余均有默认值或为 Option。
+
+修法：`/v1/models`（routed 与 translate 两种模式）同时返回 `data[]` 与 `models[]` 两套形状，`models[]` 每项带齐全部必填字段。新增 4 项测试锁定（总数 301/301）。Mac 侧待 `git pull` + 重启 launchd 后复验桌面报错消失。
