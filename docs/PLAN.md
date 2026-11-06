@@ -73,6 +73,15 @@ is chosen after checking the machine for conflicts.
 
 ## 4. Milestones
 
+> **Resequencing note (2026-11-06, project owner decision).** Build the
+> whole product first; real logins/APIs last. Concretely: the router core
+> (adapter abstraction, routing engine, accounting, dashboard) is built and
+> accepted entirely against mock upstreams and mock quota sources. Real
+> credential integrations — API keys, Gemini OAuth, the ChatGPT quota
+> endpoint — move to a final phase (M5-Credentials) after the product
+> stands. The passthrough upstream is exempt: it rides Codex's own existing
+> sign-in and needs no new login.
+
 ### M0 — Protocol spike (0.5–1 d)
 Minimal gateway: Codex → gateway → one OpenAI-compatible API upstream,
 Responses ⇄ Chat Completions translation (text + tool calls + streaming).

@@ -279,6 +279,191 @@ try {
     check('status after restore: unmanaged', Boolean(st2Json) && st2Json.managed === false, st2.stdout);
     fs.rmSync(fakeHome, { recursive: true, force: true });
   }
+
+  // =======================================================================
+  // Core phase: routed mode (config-driven registry + router + ledger).
+  // Everything below runs against mock upstreams only — no real logins,
+  // no real API keys. Each routing phase gets its own gateway port, its
+  // own config file and its own routing log.
+  // =======================================================================
+  const SUB_PORT = 18961, CHEAP_PORT = 18962, PREM_PORT = 18963, BADQ_PORT = 18964, BAD5_PORT = 18965, FILT_PORT = 18966;
+  const coreDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-core-'));
+  const quotaFile = path.join(coreDir, 'quota.json');
+  const feedbackFile = path.join(coreDir, 'feedback.json');
+  const setSubQuota = (pct) => fs.writeFileSync(quotaFile, JSON.stringify({ 'sub-main': { remainingPct: pct, resetsAt: '2026-11-06T12:00:00.000Z' } }));
+  const PRICES = { cheap: { inputPer1k: 0.001, outputPer1k: 0.002 }, premium: { inputPer1k: 0.01, outputPer1k: 0.02 } };
+  const subUp = (port) => ({ id: 'sub-main', kind: 'chat', tier: 'subscription', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'sub-model', models: ['sub-model'], quota: { source: 'mock', mockFile: quotaFile } });
+  const cheapUp = (port) => ({ id: 'cheap-api', kind: 'chat', tier: 'cheap-api', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'cheap-model', models: ['cheap-model'], price: PRICES.cheap, quota: { source: 'unavailable' } });
+  const premUp = (port) => ({ id: 'premium-api', kind: 'chat', tier: 'premium-api', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'premium-model', models: ['premium-model'], price: PRICES.premium, quota: { source: 'unavailable' } });
+  const writeCfg = (name, upstreams, rules) => {
+    const p = path.join(coreDir, name);
+    fs.writeFileSync(p, JSON.stringify({ settings: { quotaFloorPct: 2, amplePct: 25 }, rules: rules || [], upstreams }, null, 1));
+    return p;
+  };
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(SUB_PORT), MOCK_TEXT: 'Hello from sub upstream.', MOCK_USAGE_IN: '10', MOCK_USAGE_OUT: '5', MOCK_MODEL_IDS: 'sub-model' });
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(CHEAP_PORT), MOCK_TEXT: 'Hello from cheap upstream.', MOCK_USAGE_IN: '20', MOCK_USAGE_OUT: '10', MOCK_MODEL_IDS: 'cheap-model' });
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(PREM_PORT), MOCK_TEXT: 'Hello from premium upstream.', MOCK_USAGE_IN: '30', MOCK_USAGE_OUT: '15', MOCK_MODEL_IDS: 'premium-model' });
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(BADQ_PORT), MOCK_FAIL_STATUS: '429', MOCK_FAIL_CODE: 'insufficient_quota', MOCK_FAIL_MESSAGE: 'plan quota exhausted', MOCK_MODEL_IDS: 'sub-model' });
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(BAD5_PORT), MOCK_FAIL_STATUS: '500', MOCK_FAIL_CODE: 'mock_internal', MOCK_MODEL_IDS: 'cheap-model' });
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(FILT_PORT), MOCK_FAIL_STATUS: '400', MOCK_FAIL_CODE: 'content_filter', MOCK_FAIL_MESSAGE: 'request blocked by safety policy filter', MOCK_MODEL_IDS: 'sub-model' });
+  for (const p of [SUB_PORT, CHEAP_PORT, PREM_PORT, BADQ_PORT, BAD5_PORT, FILT_PORT]) await waitHealth(`http://127.0.0.1:${p}/health`);
+
+  const startRouted = async (port, cfg, log) => {
+    start(['src/gateway.js'], { RELAY_PORT: String(port), RELAY_CONFIG: cfg, RELAY_LOG_FILE: log, RELAY_FEEDBACK_FILE: feedbackFile });
+    await waitHealth(`http://127.0.0.1:${port}/health`);
+    return `http://127.0.0.1:${port}`;
+  };
+  const routedPost = async (base, body, headers = {}) => {
+    const r = await fetch(`${base}/v1/responses`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+    return { status: r.status, json: await r.json() };
+  };
+  const textOf = (json) => { const m = (json.output || []).find((o) => o.type === 'message'); return m && m.content[0].text; };
+  const entriesOf = (log) => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '').trim().split('\n').filter(Boolean)
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e && e.path === '/v1/responses');
+  const lastAttempt = (log) => { const es = entriesOf(log); return es[es.length - 1]; };
+
+  // ---- Phase A: priority, stickiness, pin, sensitive-allowed, feedback --
+  const logA = path.join(coreDir, 'routing-a.jsonl');
+  const cfgA = writeCfg('config-a.json',
+    [subUp(SUB_PORT), cheapUp(CHEAP_PORT), premUp(PREM_PORT)],
+    [{ cwdPrefix: '/work/pinned-proj', upstream: 'premium-api' }, { cwdPrefix: '/work/secret-proj', sensitive: true }]);
+  setSubQuota(80);
+  const A = await startRouted(18951, cfgA, logA);
+
+  console.log('test 14: routed priority — ample subscription quota wins');
+  {
+    const { status, json } = await routedPost(A, { model: 'mock-model', input: 'say hello', stream: false });
+    check('status 200', status === 200, `got ${status}`);
+    check('served by subscription upstream', textOf(json) === 'Hello from sub upstream.', textOf(json));
+    const e = lastAttempt(logA);
+    check('log chosen sub-main + reason initial', e && e.chosen === 'sub-main' && e.reasonCode === 'initial', JSON.stringify(e));
+    check('log carries quota snapshot (mock 80%)', e && e.quota && e.quota.remainingPct === 80 && e.quota.source === 'mock', JSON.stringify(e && e.quota));
+    const models = await (await fetch(`${A}/v1/models`)).json();
+    const ids = (models.data || []).map((m) => m.id);
+    check('routed /v1/models is the registry union', ids.includes('sub-model') && ids.includes('cheap-model') && ids.includes('premium-model'), ids.join(','));
+  }
+
+  console.log('test 15: routed priority — exhausted subscription quota falls to cheap API');
+  {
+    setSubQuota(0);
+    const { json } = await routedPost(A, { model: 'mock-model', input: 'say hello', stream: false });
+    check('served by cheap API', textOf(json) === 'Hello from cheap upstream.', textOf(json));
+    const e = lastAttempt(logA);
+    check('log chosen cheap-api + reason initial', e && e.chosen === 'cheap-api' && e.reasonCode === 'initial', JSON.stringify(e));
+  }
+
+  console.log('test 16: session stickiness — chain stays on subscription even after quota hits zero');
+  {
+    setSubQuota(80);
+    const first = await routedPost(A, { model: 'mock-model', input: 'say hello', stream: false });
+    check('first request on subscription', textOf(first.json) === 'Hello from sub upstream.', textOf(first.json));
+    setSubQuota(0);
+    const second = await routedPost(A, { model: 'mock-model', input: 'say hello again', previous_response_id: first.json.id, stream: false });
+    check('chained request still on subscription', textOf(second.json) === 'Hello from sub upstream.', textOf(second.json));
+    const e = lastAttempt(logA);
+    check('log reason sticky_session', e && e.chosen === 'sub-main' && e.reasonCode === 'sticky_session', JSON.stringify(e));
+  }
+
+  console.log('test 17: cwd pin beats automatic policy');
+  {
+    setSubQuota(80);
+    const { json } = await routedPost(A, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/pinned-proj/src' });
+    check('served by pinned premium upstream', textOf(json) === 'Hello from premium upstream.', textOf(json));
+    const e = lastAttempt(logA);
+    check('log chosen premium-api + reason pinned', e && e.chosen === 'premium-api' && e.reasonCode === 'pinned', JSON.stringify(e));
+  }
+
+  console.log('test 18: sensitive project with a subscription available stays on subscription');
+  {
+    const { status, json } = await routedPost(A, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/secret-proj' });
+    check('status 200', status === 200, `got ${status}`);
+    check('served by subscription upstream', textOf(json) === 'Hello from sub upstream.', textOf(json));
+    const e = lastAttempt(logA);
+    check('log marks sensitive routing', e && e.chosen === 'sub-main' && e.sensitive === true, JSON.stringify(e));
+  }
+
+  console.log('test 19: feedback endpoint records verdicts, rejects junk');
+  {
+    const okPost = (body) => fetch(`${A}/v1/feedback`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const up = await okPost({ requestId: 'req-test-1', verdict: 'up' });
+    check('feedback up accepted', up.status === 200, `got ${up.status}`);
+    const down = await okPost({ requestId: 'req-test-2', verdict: 'down' });
+    check('feedback down accepted', down.status === 200, `got ${down.status}`);
+    const junk = await okPost({ requestId: 'req-test-3', verdict: 'meh' });
+    check('invalid verdict rejected 400', junk.status === 400, `got ${junk.status}`);
+    const lines = fs.readFileSync(feedbackFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    check('feedback file has exactly the 2 valid entries', lines.length === 2 && lines[0].verdict === 'up' && lines[1].verdict === 'down', JSON.stringify(lines));
+  }
+
+  console.log('test 20: dual ledger reconciles with the routing log line-by-line');
+  {
+    const run = spawnSync('node', ['src/ledger.js', 'summary', '--config', cfgA, '--log', logA, '--feedback', feedbackFile], { cwd: root, encoding: 'utf8' });
+    check('ledger CLI exit 0', run.status === 0, run.stderr);
+    const summary = JSON.parse(run.stdout);
+    // Independent recomputation straight from the log + config prices.
+    const cfg = JSON.parse(fs.readFileSync(cfgA, 'utf8'));
+    const priceOf = {}; const tierOf = {};
+    for (const u of cfg.upstreams) { priceOf[u.id] = u.price || { inputPer1k: 0, outputPer1k: 0 }; tierOf[u.id] = u.tier; }
+    let expCash = 0, expQuotaTokens = 0, expServed = 0;
+    for (const e of entriesOf(logA)) {
+      if (!(e.status >= 200 && e.status < 300 && e.usage)) continue;
+      expServed++;
+      if (tierOf[e.upstream] === 'subscription') expQuotaTokens += e.usage.total_tokens;
+      else expCash += (e.usage.input_tokens / 1000) * priceOf[e.upstream].inputPer1k + (e.usage.output_tokens / 1000) * priceOf[e.upstream].outputPer1k;
+    }
+    check('served requests reconcile', summary.servedRequests === expServed, `${summary.servedRequests} vs ${expServed}`);
+    check('cash book reconciles to the cent-digit', Math.abs(summary.cash.totalUsd - expCash) < 1e-9, `${summary.cash.totalUsd} vs ${expCash}`);
+    check('quota book tokens reconcile', summary.quota.byUpstream['sub-main'] && summary.quota.byUpstream['sub-main'].totalTokens === expQuotaTokens, JSON.stringify(summary.quota));
+    check('books stay separate (cash has no subscription, quota has no API)', !('sub-main' in summary.cash.byUpstream) && !('cheap-api' in summary.quota.byUpstream) && !('premium-api' in summary.quota.byUpstream));
+    check('feedback counted in summary', summary.feedback.up === 1 && summary.feedback.down === 1, JSON.stringify(summary.feedback));
+  }
+
+  // ---- Phase B: fallback chain quota -> error -> premium ----------------
+  const logB = path.join(coreDir, 'routing-b.jsonl');
+  const cfgB = writeCfg('config-b.json', [subUp(BADQ_PORT), cheapUp(BAD5_PORT), premUp(PREM_PORT)], []);
+  const B = await startRouted(18952, cfgB, logB);
+  console.log('test 21: fallback chain — 429 quota, then 500, lands on premium; every attempt logged');
+  {
+    const { status, json } = await routedPost(B, { model: 'mock-model', input: 'say hello', stream: false });
+    check('status 200 via fallback', status === 200, `got ${status}`);
+    check('landed on premium upstream', textOf(json) === 'Hello from premium upstream.', textOf(json));
+    const es = entriesOf(logB);
+    const reqId = es[es.length - 1].requestId;
+    const attempts = es.filter((e) => e.requestId === reqId);
+    check('three attempts, one requestId', attempts.length === 3, `got ${attempts.length}`);
+    check('attempt 1: sub, initial, 429', attempts[0].chosen === 'sub-main' && attempts[0].reasonCode === 'initial' && attempts[0].status === 429, JSON.stringify(attempts[0]));
+    check('attempt 2: cheap, fallback_quota, 500', attempts[1].chosen === 'cheap-api' && attempts[1].reasonCode === 'fallback_quota' && attempts[1].status === 500, JSON.stringify(attempts[1]));
+    check('attempt 3: premium, fallback_error, 200', attempts[2].chosen === 'premium-api' && attempts[2].reasonCode === 'fallback_error' && attempts[2].status === 200, JSON.stringify(attempts[2]));
+  }
+
+  // ---- Phase B2: safety-filter fallback ---------------------------------
+  const logB2 = path.join(coreDir, 'routing-b2.jsonl');
+  const cfgB2 = writeCfg('config-b2.json', [subUp(FILT_PORT), cheapUp(CHEAP_PORT)], []);
+  const B2 = await startRouted(18953, cfgB2, logB2);
+  console.log('test 22: safety-filter refusal falls back with fallback_filtered');
+  {
+    const { status, json } = await routedPost(B2, { model: 'mock-model', input: 'say hello', stream: false });
+    check('status 200 via fallback', status === 200, `got ${status}`);
+    check('landed on cheap upstream', textOf(json) === 'Hello from cheap upstream.', textOf(json));
+    const es = entriesOf(logB2);
+    const attempts = es.filter((e) => e.requestId === es[es.length - 1].requestId);
+    check('attempt 2 reason fallback_filtered', attempts.length === 2 && attempts[1].chosen === 'cheap-api' && attempts[1].reasonCode === 'fallback_filtered', JSON.stringify(attempts));
+  }
+
+  // ---- Phase C: sensitive fail-closed ------------------------------------
+  const logC = path.join(coreDir, 'routing-c.jsonl');
+  const cfgC = writeCfg('config-c.json', [cheapUp(CHEAP_PORT), premUp(PREM_PORT)], [{ cwdPrefix: '/work/secret-proj', sensitive: true }]);
+  const C = await startRouted(18954, cfgC, logC);
+  console.log('test 23: sensitive project with no subscription upstream fails closed');
+  {
+    const { status, json } = await routedPost(C, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/secret-proj' });
+    check('refused with 403', status === 403, `got ${status}`);
+    check('error code sensitive_block + fail-closed message', json.error && json.error.code === 'sensitive_block' && /fail-closed/i.test(json.error.message), JSON.stringify(json).slice(0, 200));
+    const e = lastAttempt(logC);
+    check('log reasonCode sensitive_block, nothing chosen', e && e.reasonCode === 'sensitive_block' && e.chosen === null, JSON.stringify(e));
+    const okReq = await routedPost(C, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/public-proj' });
+    check('non-sensitive cwd on same gateway still routes', okReq.status === 200 && textOf(okReq.json) === 'Hello from cheap upstream.', `got ${okReq.status}`);
+  }
 } catch (err) {
   failed++;
   console.log('FATAL', err && err.stack || err);

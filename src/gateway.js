@@ -38,12 +38,38 @@
  *                        stream, or was unreachable after the single retry
  *   client_abort         the client disconnected before completion
  * Authorization values are NEVER logged (only the boolean "authPresent").
+ *
+ * Core phase — routed mode: when a config file exists (RELAY_CONFIG or
+ * <repo>/relay.config.json; see src/config.js), POST /v1/responses is
+ * served by the routing engine instead of the single env upstream:
+ *   - src/upstreams.js  registry of configured upstreams (kind/tier/price)
+ *   - src/quota.js      quota sources (mock / metering-estimate / unavailable)
+ *   - src/router.js     priority + stickiness + pins + sensitive fail-closed
+ * Every ATTEMPT is logged with requestId, chosen upstream, attempt number,
+ * the decision reasonCode and a quota snapshot. Routed reasonCodes:
+ *   initial          first attempt, automatic policy pick
+ *   pinned           first attempt, a cwd rule pinned this upstream
+ *   sticky_session   first attempt, this session chain already lives here
+ *   fallback_quota   previous attempt failed on quota/429
+ *   fallback_filtered previous attempt was refused by a safety filter
+ *   fallback_error   previous attempt failed otherwise (5xx/connect/timeout)
+ *   sensitive_block  sensitive project, no subscription upstream: refused
+ *   client_abort / upstream_error as in legacy mode
+ * With no config file the gateway behaves exactly as M1 (legacy mode).
+ *
+ * POST /v1/feedback {requestId, verdict:"up"|"down"} appends to the
+ * feedback log (RELAY_FEEDBACK_FILE, default <repo>/logs/feedback.jsonl).
+ * Record + count only (see src/ledger.js); no automatic tuning yet.
  */
 const http = require('node:http');
 const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { loadConfig } = require('./config');
+const { createRegistry, resolveTarget, classifyFailure, fallbackReasonCode } = require('./upstreams');
+const { createQuotaService } = require('./quota');
+const routerEngine = require('./router');
 
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.RELAY_PORT || 18923);
@@ -54,6 +80,18 @@ const PASSTHROUGH_URL = process.env.RELAY_PASSTHROUGH_URL || 'https://chatgpt.co
 const TIMEOUT_MS = Number(process.env.RELAY_UPSTREAM_TIMEOUT_MS || 120000);
 const MODELS_OVERRIDE = (process.env.RELAY_MODELS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const LOG_FILE = process.env.RELAY_LOG_FILE || path.join(__dirname, '..', 'logs', 'routing.jsonl');
+const FEEDBACK_FILE = process.env.RELAY_FEEDBACK_FILE || path.join(__dirname, '..', 'logs', 'feedback.jsonl');
+
+// Routed-mode assembly. A malformed config file is a hard startup error:
+// silently falling back to legacy mode would route traffic somewhere the
+// operator did not intend.
+let CONFIG = null;
+try { CONFIG = loadConfig(); } catch (err) {
+  process.stderr.write(JSON.stringify({ event: 'config_error', message: err.message }) + '\n');
+  process.exit(1);
+}
+const registry = CONFIG ? createRegistry(CONFIG) : null;
+const quotaService = CONFIG ? createQuotaService({ config: CONFIG, registry, logFile: LOG_FILE }) : null;
 
 let logDirReady = false;
 function logRoute(entry) {
@@ -304,46 +342,62 @@ function chatToResponse(chat, model) {
 }
 
 // ---------------------------------------------------------------------------
-// translate mode
+// translate mode. The attempt functions serve one upstream target and
+// RETURN an outcome instead of logging/sending errors themselves, so the
+// routed engine can fall back; the legacy wrappers below reproduce the
+// exact M0/M1 behavior (log lines + mapped error responses) on top.
+//   outcome 'success'       response fully written to the client
+//   outcome 'failure'       upstream answered >=400 pre-output; nothing
+//                           written yet, caller may fall back or send
+//                           `mapped` as the error response
+//   outcome 'stream_broken' upstream SSE died mid-stream; a terminal
+//                           response.failed was already written
+//   outcome 'client_abort'  client went away mid-stream
+// Transport exceptions (connect/timeout) are thrown, as before.
 // ---------------------------------------------------------------------------
-function chatCompletionsCall(chatReq, accept) {
+function chatCompletionsCallTo(baseUrl, apiKey, chatReq, accept) {
   const payload = Buffer.from(JSON.stringify(chatReq));
   const headers = { 'content-type': 'application/json', 'content-length': payload.length, accept };
-  if (UPSTREAM_API_KEY) headers.authorization = `Bearer ${UPSTREAM_API_KEY}`;
-  return upstreamPostWithRetry(UPSTREAM_BASE + '/chat/completions', payload, headers);
+  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+  return upstreamPostWithRetry(baseUrl + '/chat/completions', payload, headers);
+}
+
+function chatCompletionsCall(chatReq, accept) {
+  return chatCompletionsCallTo(UPSTREAM_BASE, UPSTREAM_API_KEY, chatReq, accept);
 }
 
 function translateLogBase(body) {
   return { path: '/v1/responses', mode: 'translate', upstream: UPSTREAM_BASE, model: body.model || null, authPresent: false };
 }
 
-async function handleTranslateNonStream(req, res, body, startedAt) {
+const ENV_TARGET = { baseUrl: UPSTREAM_BASE, apiKey: UPSTREAM_API_KEY, model: null };
+
+async function attemptTranslateNonStream(res, body, target) {
   const chatReq = responsesToChat(body);
-  const upRes = await chatCompletionsCall(chatReq, 'application/json');
+  if (target.model) chatReq.model = target.model;
+  const upRes = await chatCompletionsCallTo(target.baseUrl, target.apiKey, chatReq, 'application/json');
   armBodyTimeout(upRes);
   const raw = await readBody(upRes);
   if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
     const mapped = mapUpstreamErrorBody(upRes.statusCode, raw);
-    logRoute({ ...translateLogBase(body), stream: false, status: upRes.statusCode, reasonCode: 'upstream_error', ms: Date.now() - startedAt });
-    sendError(res, upRes.statusCode, mapped.message, mapped.type, mapped.code);
-    return;
+    return { outcome: 'failure', failureKind: classifyFailure({ status: upRes.statusCode, code: mapped.code, type: mapped.type, message: mapped.message }), status: upRes.statusCode, mapped };
   }
   const chat = JSON.parse(raw.toString('utf8'));
   const response = chatToResponse(chat, body.model);
-  logRoute({ ...translateLogBase(body), stream: false, status: 200, reasonCode: 'translate_default', usage: response.usage, ms: Date.now() - startedAt });
+  if (body.model) response.model = body.model; // the client sees the model it asked for
   sendJson(res, 200, response);
+  return { outcome: 'success', status: 200, usage: response.usage, responseId: response.id };
 }
 
-async function handleTranslateStream(req, res, body, startedAt) {
+async function attemptTranslateStream(res, body, target) {
   const chatReq = responsesToChat(body);
-  const upRes = await chatCompletionsCall(chatReq, 'text/event-stream');
+  if (target.model) chatReq.model = target.model;
+  const upRes = await chatCompletionsCallTo(target.baseUrl, target.apiKey, chatReq, 'text/event-stream');
   armBodyTimeout(upRes);
   if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
     const raw = await readBody(upRes);
     const mapped = mapUpstreamErrorBody(upRes.statusCode, raw);
-    logRoute({ ...translateLogBase(body), stream: true, status: upRes.statusCode, reasonCode: 'upstream_error', ms: Date.now() - startedAt });
-    sendError(res, upRes.statusCode, mapped.message, mapped.type, mapped.code);
-    return;
+    return { outcome: 'failure', failureKind: classifyFailure({ status: upRes.statusCode, code: mapped.code, type: mapped.type, message: mapped.message }), status: upRes.statusCode, mapped };
   }
 
   let clientAborted = false;
@@ -446,17 +500,15 @@ async function handleTranslateStream(req, res, body, startedAt) {
   });
 
   if (clientAborted) {
-    logRoute({ ...translateLogBase(body), stream: true, status: 499, reasonCode: 'client_abort', ms: Date.now() - startedAt });
     if (!res.writableEnded) res.end();
-    return;
+    return { outcome: 'client_abort', status: 499 };
   }
   if (streamFailure) {
     // Terminate the Responses stream legally instead of hanging the client.
     const errObj = { message: `upstream stream interrupted: ${streamFailure.message}`, type: 'relay_upstream_error', param: null, code: streamFailure.code || 'upstream_stream_broken' };
     emit('response.failed', { response: baseResponse('failed', [], mapUsage(usage), errObj) });
     res.end();
-    logRoute({ ...translateLogBase(body), stream: true, status: 502, reasonCode: 'upstream_error', error: errObj.code, ms: Date.now() - startedAt });
-    return;
+    return { outcome: 'stream_broken', status: 502, usage: mapUsage(usage), errorCode: errObj.code };
   }
 
   // Finalize output items in output_index order.
@@ -472,27 +524,286 @@ async function handleTranslateStream(req, res, body, startedAt) {
   const finalResponse = baseResponse('completed', finalOutput, mapUsage(usage));
   emit('response.completed', { response: finalResponse });
   res.end();
-  logRoute({ ...translateLogBase(body), stream: true, status: 200, reasonCode: 'translate_default', finishReason, usage: finalResponse.usage, ms: Date.now() - startedAt });
+  return { outcome: 'success', status: 200, usage: finalResponse.usage, responseId, finishReason };
 }
 
+/** Legacy translate path (no config): M0/M1 behavior on top of the attempts. */
 async function handleTranslate(req, res, rawBody, startedAt) {
   let body;
   try { body = JSON.parse(rawBody.toString('utf8')); } catch { sendError(res, 400, 'invalid JSON body', 'relay_bad_request', 'invalid_json'); return; }
+  const base = translateLogBase(body);
   try {
-    if (body.stream) await handleTranslateStream(req, res, body, startedAt);
-    else await handleTranslateNonStream(req, res, body, startedAt);
+    const r = body.stream
+      ? await attemptTranslateStream(res, body, ENV_TARGET)
+      : await attemptTranslateNonStream(res, body, ENV_TARGET);
+    if (r.outcome === 'success') {
+      logRoute({ ...base, stream: Boolean(body.stream), status: 200, reasonCode: 'translate_default', usage: r.usage, ...(body.stream ? { finishReason: r.finishReason } : {}), ms: Date.now() - startedAt });
+    } else if (r.outcome === 'failure') {
+      logRoute({ ...base, stream: Boolean(body.stream), status: r.status, reasonCode: 'upstream_error', ms: Date.now() - startedAt });
+      sendError(res, r.status, r.mapped.message, r.mapped.type, r.mapped.code);
+    } else if (r.outcome === 'client_abort') {
+      logRoute({ ...base, stream: true, status: 499, reasonCode: 'client_abort', ms: Date.now() - startedAt });
+    } else if (r.outcome === 'stream_broken') {
+      logRoute({ ...base, stream: true, status: 502, reasonCode: 'upstream_error', error: r.errorCode, ms: Date.now() - startedAt });
+    }
   } catch (err) {
     const status = isTimeoutErr(err) ? 504 : 502;
-    logRoute({ ...translateLogBase(body), stream: Boolean(body && body.stream), status, reasonCode: 'upstream_error', error: err.code || err.message, ms: Date.now() - startedAt });
+    logRoute({ ...base, stream: Boolean(body && body.stream), status, reasonCode: 'upstream_error', error: err.code || err.message, ms: Date.now() - startedAt });
     if (!res.headersSent) sendError(res, status, isTimeoutErr(err) ? `translate upstream timeout after ${TIMEOUT_MS}ms` : `translate upstream error: ${err.message}`, isTimeoutErr(err) ? 'relay_upstream_timeout' : 'relay_upstream_error', err.code || null);
     else if (!res.writableEnded) res.end();
   }
 }
 
 // ---------------------------------------------------------------------------
+// routed mode (config present): passthrough attempt + routing engine
+// ---------------------------------------------------------------------------
+
+/**
+ * One passthrough attempt against a configured target URL. Unlike the
+ * legacy handler it does NOT retry internally (the router's fallback
+ * chain owns recovery) and it resolves an outcome: error statuses are
+ * captured BEFORE any byte reaches the client so a fallback is still
+ * possible; once a 2xx stream starts it is piped (tapped for the
+ * response id + final usage) and can no longer fall back.
+ */
+function attemptPassthrough(req, res, rawBody, targetUrl) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (o) => { if (!settled) { settled = true; resolve(o); } };
+    const target = new URL(targetUrl);
+    const headers = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (['host', 'connection', 'content-length', 'transfer-encoding'].includes(k)) continue;
+      headers[k] = v;
+    }
+    if (rawBody.length) headers['content-length'] = rawBody.length;
+    const lib = target.protocol === 'http:' ? http : https;
+    let up = null;
+    let clientAborted = false;
+    res.on('close', () => {
+      if (!res.writableEnded && !settled) {
+        clientAborted = true;
+        if (up) up.destroy();
+        done({ outcome: 'client_abort', status: 499 });
+      }
+    });
+    const timer = setTimeout(() => {
+      const err = new Error(`upstream timeout after ${TIMEOUT_MS}ms`);
+      err.code = 'RELAY_TIMEOUT';
+      if (up) up.destroy(err);
+    }, TIMEOUT_MS);
+    up = lib.request(
+      { method: req.method, hostname: target.hostname, port: target.port || (target.protocol === 'http:' ? 80 : 443), path: target.pathname + target.search, headers },
+      (upRes) => {
+        clearTimeout(timer);
+        armBodyTimeout(upRes);
+        if (upRes.statusCode >= 400) {
+          readBody(upRes).then((raw) => {
+            const mapped = mapUpstreamErrorBody(upRes.statusCode, raw);
+            done({ outcome: 'failure', failureKind: classifyFailure({ status: upRes.statusCode, code: mapped.code, type: mapped.type, message: mapped.message }), status: upRes.statusCode, mapped });
+          }).catch(() => done({ outcome: 'failure', failureKind: 'error', status: upRes.statusCode, mapped: { message: `upstream returned HTTP ${upRes.statusCode}`, type: 'relay_upstream_error', code: `upstream_${upRes.statusCode}` } }));
+          return;
+        }
+        const outHeaders = {};
+        for (const [k, v] of Object.entries(upRes.headers)) {
+          if (['connection', 'transfer-encoding', 'content-length'].includes(k)) continue;
+          outHeaders[k] = v;
+        }
+        res.writeHead(upRes.statusCode, outHeaders);
+        // Tap the stream for the terminal response id + usage (stickiness
+        // keys and the ledger need them; the bytes pass through untouched).
+        let scan = '';
+        let responseId = null;
+        let usage = null;
+        upRes.on('data', (c) => {
+          scan = (scan + c.toString('utf8')).slice(-262144);
+          if (!responseId) { const m = scan.match(/"id":"(resp_[^"]+)"/); if (m) responseId = m[1]; }
+        });
+        upRes.pipe(res);
+        upRes.on('end', () => {
+          for (const line of scan.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            try {
+              const ev = JSON.parse(line.slice(5).trim());
+              if (ev.type === 'response.completed' && ev.response) {
+                if (ev.response.id) responseId = ev.response.id;
+                if (ev.response.usage) usage = ev.response.usage;
+              }
+            } catch { /* partial tail line */ }
+          }
+          done({ outcome: 'success', status: upRes.statusCode, usage, responseId });
+        });
+        upRes.on('error', (err) => {
+          if (!res.writableEnded) res.destroy();
+          done({ outcome: 'stream_broken', status: 502, errorCode: err.code || 'upstream_stream_broken' });
+        });
+      },
+    );
+    up.on('error', (err) => {
+      clearTimeout(timer);
+      if (clientAborted || settled) return;
+      const status = isTimeoutErr(err) ? 504 : 502;
+      done({ outcome: 'failure', failureKind: 'error', status, mapped: { message: isTimeoutErr(err) ? `passthrough upstream timeout after ${TIMEOUT_MS}ms` : `passthrough upstream error: ${err.message}`, type: isTimeoutErr(err) ? 'relay_upstream_timeout' : 'relay_upstream_error', code: err.code || null } });
+    });
+    if (req.method === 'GET' || !rawBody.length) up.end();
+    else up.end(rawBody);
+  });
+}
+
+// Session-chain stickiness. Approximation, stated plainly: the chain key
+// is the request's previous_response_id (each successful response's id is
+// remembered against the upstream that served it, so the next request in
+// the chain resolves to the same upstream). Clients that send a stable
+// session header (session-id / x-session-id) get the same treatment.
+// There is no server-side session table to lean on — if the gateway
+// restarts, chains re-decide from policy, which PLAN §3.1 tolerates
+// (switching is defined at session start; a restart starts fresh).
+const stickyChains = new Map();
+function chainKeyFor(req, body) {
+  if (body && typeof body.previous_response_id === 'string' && body.previous_response_id) return 'prev:' + body.previous_response_id;
+  const sid = req.headers['session-id'] || req.headers['x-session-id'] || req.headers.session_id;
+  if (sid) return 'hdr:' + sid;
+  return null;
+}
+function rememberChain(key, responseId, upstreamId) {
+  if (stickyChains.size > 10000) stickyChains.clear();
+  if (key) stickyChains.set(key, upstreamId);
+  if (responseId) stickyChains.set('prev:' + responseId, upstreamId);
+}
+
+/**
+ * Working directory for rule matching, best effort: Responses requests
+ * do not standardize a cwd field, so Relay checks (in order) a
+ * metadata.cwd in the body, the x-relay-cwd header (set by wrappers /
+ * tests), and RELAY_DEFAULT_CWD. No cwd simply means no rule matches.
+ */
+function cwdFor(req, body) {
+  if (body && body.metadata && typeof body.metadata.cwd === 'string') return body.metadata.cwd;
+  if (req.headers['x-relay-cwd']) return String(req.headers['x-relay-cwd']);
+  return process.env.RELAY_DEFAULT_CWD || null;
+}
+
+async function handleRouted(req, res, rawBody, startedAt) {
+  const requestId = rid('req_');
+  let body = null;
+  try { body = JSON.parse(rawBody.toString('utf8')); } catch { /* handled below */ }
+  const quotas = quotaService.snapshot();
+  const chainKey = body ? chainKeyFor(req, body) : null;
+  const stickyId = chainKey ? (stickyChains.get(chainKey) || null) : null;
+  const cwd = cwdFor(req, body);
+  const logAttempt = (fields) => logRoute({
+    requestId, path: '/v1/responses', mode: 'routed', upstream: null, model: body ? (body.model || null) : null,
+    cwd: cwd || null, authPresent: Boolean(req.headers.authorization), ms: Date.now() - startedAt, ...fields,
+  });
+
+  if (!body) {
+    logAttempt({ chosen: null, attempt: 0, status: 400, reasonCode: 'initial', error: 'invalid_json' });
+    sendError(res, 400, 'invalid JSON body', 'relay_bad_request', 'invalid_json');
+    return;
+  }
+
+  const decision = routerEngine.decide({
+    registry, rules: CONFIG.rules, settings: CONFIG.settings,
+    quotas, cwd, stickyUpstreamId: stickyId,
+  });
+
+  if (decision.blocked) {
+    logAttempt({ chosen: null, attempt: 0, status: 403, reasonCode: decision.blocked.reasonCode, quota: null });
+    sendError(res, 403, decision.blocked.message, 'relay_sensitive_block', 'sensitive_block');
+    return;
+  }
+  if (!decision.candidates.length) {
+    logAttempt({ chosen: null, attempt: 0, status: 503, reasonCode: 'initial', error: 'no_upstreams' });
+    sendError(res, 503, 'Relay: no upstreams are configured/enabled.', 'relay_no_upstream', 'no_upstreams');
+    return;
+  }
+
+  let lastFailureKind = null;
+  let lastMapped = null;
+  let lastStatus = 502;
+  for (let i = 0; i < decision.candidates.length; i++) {
+    const { upstream, reason } = decision.candidates[i];
+    const reasonCode = i === 0 ? (reason || 'initial') : fallbackReasonCode(lastFailureKind);
+    const q = quotas[upstream.id] || { remainingPct: null, source: 'unavailable' };
+    const quotaSnap = { remainingPct: q.remainingPct, source: q.source, ...(q.resetsAt ? { resetsAt: q.resetsAt } : {}) };
+    const target = resolveTarget(upstream);
+    let r;
+    if (!target.baseUrl) {
+      r = { outcome: 'failure', failureKind: 'error', status: 502, mapped: { message: `upstream ${upstream.id} has no baseUrl configured`, type: 'relay_config_error', code: 'missing_base_url' } };
+    } else if (upstream.kind === 'passthrough') {
+      r = await attemptPassthrough(req, res, rawBody, target.baseUrl);
+    } else {
+      try {
+        r = body.stream
+          ? await attemptTranslateStream(res, body, target)
+          : await attemptTranslateNonStream(res, body, target);
+      } catch (err) {
+        const status = isTimeoutErr(err) ? 504 : 502;
+        r = { outcome: 'failure', failureKind: 'error', status, mapped: { message: isTimeoutErr(err) ? `upstream timeout after ${TIMEOUT_MS}ms` : `upstream error: ${err.message}`, type: isTimeoutErr(err) ? 'relay_upstream_timeout' : 'relay_upstream_error', code: err.code || null } };
+      }
+    }
+
+    if (r.outcome === 'success') {
+      logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: r.status || 200, reasonCode, quota: quotaSnap, usage: r.usage || null, ...(decision.sensitive ? { sensitive: true } : {}) });
+      rememberChain(chainKey, r.responseId, upstream.id);
+      return;
+    }
+    if (r.outcome === 'client_abort') {
+      logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: 499, reasonCode: 'client_abort', quota: quotaSnap });
+      if (!res.writableEnded && !res.headersSent) res.end();
+      return;
+    }
+    if (r.outcome === 'stream_broken') {
+      // Bytes already reached the client: no fallback is possible.
+      logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: 502, reasonCode: 'upstream_error', quota: quotaSnap, error: r.errorCode || 'upstream_stream_broken' });
+      return;
+    }
+    lastFailureKind = r.failureKind || 'error';
+    lastMapped = r.mapped || null;
+    lastStatus = r.status || 502;
+    logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: lastStatus, reasonCode, quota: quotaSnap, error: lastMapped ? lastMapped.code : null, willFallback: i < decision.candidates.length - 1 });
+  }
+  if (!res.headersSent) {
+    sendError(res, lastStatus, lastMapped ? lastMapped.message : 'all upstreams failed', lastMapped ? lastMapped.type : 'relay_upstream_error', lastMapped ? lastMapped.code : null);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/feedback — record + count only (counting lives in ledger.js)
+// ---------------------------------------------------------------------------
+async function handleFeedback(req, res, rawBody) {
+  let body;
+  try { body = JSON.parse(rawBody.toString('utf8')); } catch { sendError(res, 400, 'invalid JSON body', 'relay_bad_request', 'invalid_json'); return; }
+  if (!body || typeof body.requestId !== 'string' || !body.requestId || !['up', 'down'].includes(body.verdict)) {
+    sendError(res, 400, 'feedback requires {requestId: string, verdict: "up" | "down"}', 'relay_bad_request', 'invalid_feedback');
+    return;
+  }
+  const entry = { ts: new Date().toISOString(), requestId: body.requestId, verdict: body.verdict };
+  try {
+    fs.mkdirSync(path.dirname(FEEDBACK_FILE), { recursive: true });
+    fs.appendFileSync(FEEDBACK_FILE, JSON.stringify(entry) + '\n');
+  } catch (err) {
+    sendError(res, 500, `could not record feedback: ${err.message}`, 'relay_internal_error', 'feedback_write_failed');
+    return;
+  }
+  sendJson(res, 200, { ok: true });
+}
+
+// ---------------------------------------------------------------------------
 // GET /v1/models
 // ---------------------------------------------------------------------------
 async function handleModels(req, res, url, startedAt) {
+  if (CONFIG) {
+    // Routed mode: the model list is the union of the enabled upstreams'
+    // declared models (falling back to their pinned `model` values).
+    const ids = [];
+    for (const u of registry.enabled()) {
+      for (const m of [...u.models, ...(u.model ? [u.model] : [])]) if (!ids.includes(m)) ids.push(m);
+    }
+    logRoute({ path: '/v1/models', mode: 'routed', upstream: null, model: null, authPresent: Boolean(req.headers.authorization), status: 200, reasonCode: 'initial', ms: Date.now() - startedAt });
+    sendJson(res, 200, { object: 'list', data: ids.map((id) => ({ id, object: 'model', created: 0, owned_by: 'relay' })) });
+    return;
+  }
   if (MODE === 'passthrough') {
     const pt = new URL(PASSTHROUGH_URL);
     const modelsPath = pt.pathname.replace(/\/responses\/?$/, '/models');
@@ -544,10 +855,16 @@ async function handleModels(req, res, url, startedAt) {
 const server = http.createServer(async (req, res) => {
   const startedAt = Date.now();
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
-  if (req.method === 'GET' && url.pathname === '/health') { sendJson(res, 200, { ok: true, mode: MODE }); return; }
+  if (req.method === 'GET' && url.pathname === '/health') { sendJson(res, 200, { ok: true, mode: CONFIG ? 'routed' : MODE, routed: Boolean(CONFIG), upstreams: CONFIG ? registry.enabled().length : null }); return; }
   if (req.method === 'GET' && url.pathname === '/v1/models') { await handleModels(req, res, url, startedAt); return; }
+  if (req.method === 'POST' && url.pathname === '/v1/feedback') {
+    const rawBody = await readBody(req);
+    await handleFeedback(req, res, rawBody);
+    return;
+  }
   if (req.method === 'POST' && url.pathname === '/v1/responses') {
     const rawBody = await readBody(req);
+    if (CONFIG) { await handleRouted(req, res, rawBody, startedAt); return; }
     if (MODE === 'passthrough') {
       let model = null;
       try { model = JSON.parse(rawBody.toString('utf8')).model || null; } catch { /* keep null */ }
@@ -557,6 +874,6 @@ const server = http.createServer(async (req, res) => {
   }
   sendError(res, 404, 'not found', 'relay_not_found', 'not_found');
 });
-server.listen(PORT, HOST, () => logRoute({ event: 'listen', host: HOST, port: PORT, mode: MODE, logFile: LOG_FILE }));
+server.listen(PORT, HOST, () => logRoute({ event: 'listen', host: HOST, port: PORT, mode: CONFIG ? 'routed' : MODE, logFile: LOG_FILE }));
 
-module.exports = { responsesToChat, chatToResponse, mapUsage, mapUpstreamErrorBody };
+module.exports = { responsesToChat, chatToResponse, mapUsage, mapUpstreamErrorBody, classifyFailure };

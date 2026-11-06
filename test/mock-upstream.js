@@ -23,19 +23,32 @@
 const http = require('node:http');
 
 const PORT = Number(process.env.MOCK_PORT || 18924);
-const TEXT = 'Hello from mock upstream.';
+const TEXT = process.env.MOCK_TEXT || 'Hello from mock upstream.';
 const TOOL_ARGS = JSON.stringify({ text: 'hello-from-tool' });
+// Core-phase additions (all optional, defaults preserve M0/M1 behavior):
+//   MOCK_USAGE_IN / MOCK_USAGE_OUT  fixed usage for every reply
+//   MOCK_FAIL_STATUS (+ MOCK_FAIL_CODE / MOCK_FAIL_MESSAGE)
+//                                   every chat request fails with this status
+//   MOCK_MODEL_IDS                  comma list served by GET /v1/models
+const USAGE_OVERRIDE = (process.env.MOCK_USAGE_IN != null || process.env.MOCK_USAGE_OUT != null)
+  ? { prompt_tokens: Number(process.env.MOCK_USAGE_IN || 0), completion_tokens: Number(process.env.MOCK_USAGE_OUT || 0) }
+  : null;
+if (USAGE_OVERRIDE) USAGE_OVERRIDE.total_tokens = USAGE_OVERRIDE.prompt_tokens + USAGE_OVERRIDE.completion_tokens;
+const FAIL_STATUS = process.env.MOCK_FAIL_STATUS ? Number(process.env.MOCK_FAIL_STATUS) : null;
+const FAIL_CODE = process.env.MOCK_FAIL_CODE || 'mock_forced_failure';
+const FAIL_MESSAGE = process.env.MOCK_FAIL_MESSAGE || 'mock forced failure';
+const MODEL_IDS = (process.env.MOCK_MODEL_IDS || 'mock-model,mock-model-2').split(',').map((s) => s.trim()).filter(Boolean);
 
 function plan(body) {
   const messages = body.messages || [];
   const toolMsg = messages.find((m) => m.role === 'tool');
-  if (toolMsg) return { kind: 'text', text: `After tool: ${toolMsg.content}`, usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 } };
+  if (toolMsg) return { kind: 'text', text: `After tool: ${toolMsg.content}`, usage: USAGE_OVERRIDE || { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 } };
   const allText = messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('\n');
   if (allText.includes('CALL_TOOL')) {
     const name = (body.tools && body.tools[0] && body.tools[0].function && body.tools[0].function.name) || 'run_echo';
-    return { kind: 'tool', name, usage: { prompt_tokens: 12, completion_tokens: 9, total_tokens: 21 } };
+    return { kind: 'tool', name, usage: USAGE_OVERRIDE || { prompt_tokens: 12, completion_tokens: 9, total_tokens: 21 } };
   }
-  return { kind: 'text', text: TEXT, usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 } };
+  return { kind: 'text', text: TEXT, usage: USAGE_OVERRIDE || { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 } };
 }
 
 function chunk(id, created, model, delta, finishReason) {
@@ -51,6 +64,12 @@ function sendUpstreamError(res, status, message, type, code) {
 }
 
 function handleChat(req, res, body) {
+  // --- core-phase forced failure (whole instance), checked first ---
+  if (FAIL_STATUS) {
+    const type = FAIL_STATUS === 429 ? 'rate_limit_error' : FAIL_STATUS >= 500 ? 'server_error' : 'invalid_request_error';
+    sendUpstreamError(res, FAIL_STATUS, FAIL_MESSAGE, type, FAIL_CODE);
+    return;
+  }
   // --- M1 scripted failure modes, checked before the normal plan ---
   const allText = (body.messages || []).map((m) => (typeof m.content === 'string' ? m.content : '')).join('\n');
   if (allText.includes('FAIL_429')) { sendUpstreamError(res, 429, 'mock rate limit exceeded', 'rate_limit_error', 'mock_rate_limit'); return; }
@@ -117,10 +136,7 @@ function handleChatNormal(req, res, body) {
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); return; }
   if (req.method === 'GET' && req.url === '/v1/models') {
-    const s = JSON.stringify({ object: 'list', data: [
-      { id: 'mock-model', object: 'model', created: 1700000000, owned_by: 'mock' },
-      { id: 'mock-model-2', object: 'model', created: 1700000000, owned_by: 'mock' },
-    ] });
+    const s = JSON.stringify({ object: 'list', data: MODEL_IDS.map((id) => ({ id, object: 'model', created: 1700000000, owned_by: 'mock' })) });
     res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(s) });
     res.end(s);
     return;
