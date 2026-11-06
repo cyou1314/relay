@@ -49,6 +49,13 @@
  *                       / unavailable)
  *   - src/router.js     priority + stickiness + pins + sensitive fail-closed
  *   - src/difficulty.js task-difficulty classifier (second routing axis)
+ * Upstream kind 'gemini' (wiring phase) dispatches through
+ * src/gemini.js instead of a Chat Completions call: Google's Cloud
+ * Code protocol (v1internal generateContent / streamGenerateContent)
+ * with the OAuth credential managed by src/gemini-creds.js (Gemini
+ * CLI-shaped oauth_creds.json, env RELAY_GEMINI_CREDS). A missing or
+ * unrefreshable credential surfaces as a 401 for that upstream only,
+ * i.e. the router's fallback_auth path — see docs/GEMINI-REPORT.md.
  * Every ATTEMPT is logged with requestId, chosen upstream, attempt number,
  * the decision reasonCode, a quota snapshot, the difficulty verdict
  * ({level, score} + signals on the line) and the model actually served
@@ -100,6 +107,8 @@ const { createQuotaService } = require('./quota');
 const routerEngine = require('./router');
 const difficultyEngine = require('./difficulty');
 const { createDashboard } = require('./dashboard');
+const { createGeminiCredsService } = require('./gemini-creds');
+const { createGeminiTransport } = require('./gemini');
 
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.RELAY_PORT || 18923);
@@ -424,6 +433,35 @@ function chatCompletionsCallTo(baseUrl, apiKey, chatReq, accept) {
   return upstreamPostWithRetry(baseUrl + '/chat/completions', payload, headers);
 }
 
+// Gemini kind (src/gemini.js + src/gemini-creds.js): the credential
+// service reads the Gemini CLI-shaped OAuth file (env
+// RELAY_GEMINI_CREDS, default ~/.gemini/oauth_creds.json) and refreshes
+// it when expired; the transport speaks Google's Cloud Code protocol
+// and answers in the same Chat surface as chatCompletionsCallTo, so
+// both attempt functions below — and with them the whole fallback /
+// error-mapping machinery — work unchanged. Creating the service is
+// inert: no file is read and no request is made until a gemini
+// upstream is actually dispatched.
+const geminiCredsService = createGeminiCredsService({});
+const geminiTransport = createGeminiTransport({
+  credsService: geminiCredsService,
+  postJson: (url, payload, headers) => upstreamPostWithRetry(url, payload, headers),
+});
+
+/** The one dispatch point for translate attempts: 'gemini' targets go
+ *  to the Cloud Code transport, everything else to Chat Completions. */
+function dispatchTranslateCall(target, chatReq, stream) {
+  if (target && target.kind === 'gemini') {
+    return geminiTransport.call(chatReq, {
+      stream,
+      model: target.model || chatReq.model,
+      project: target.project || null,
+      baseUrl: target.baseUrl || null,
+    });
+  }
+  return chatCompletionsCallTo(target.baseUrl, target.apiKey, chatReq, stream ? 'text/event-stream' : 'application/json');
+}
+
 function chatCompletionsCall(chatReq, accept) {
   return chatCompletionsCallTo(UPSTREAM_BASE, UPSTREAM_API_KEY, chatReq, accept);
 }
@@ -437,7 +475,7 @@ const ENV_TARGET = { baseUrl: UPSTREAM_BASE, apiKey: UPSTREAM_API_KEY, model: nu
 async function attemptTranslateNonStream(res, body, target) {
   const chatReq = responsesToChat(body);
   if (target.model) chatReq.model = target.model;
-  const upRes = await chatCompletionsCallTo(target.baseUrl, target.apiKey, chatReq, 'application/json');
+  const upRes = await dispatchTranslateCall(target, chatReq, false);
   armBodyTimeout(upRes);
   const raw = await readBody(upRes);
   if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
@@ -454,7 +492,7 @@ async function attemptTranslateNonStream(res, body, target) {
 async function attemptTranslateStream(res, body, target) {
   const chatReq = responsesToChat(body);
   if (target.model) chatReq.model = target.model;
-  const upRes = await chatCompletionsCallTo(target.baseUrl, target.apiKey, chatReq, 'text/event-stream');
+  const upRes = await dispatchTranslateCall(target, chatReq, true);
   armBodyTimeout(upRes);
   if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
     const raw = await readBody(upRes);
@@ -824,7 +862,9 @@ async function handleRouted(req, res, rawBody, startedAt) {
     if (chosenModel) target.model = chosenModel;
     const servedModel = chosenModel || target.model || (body && body.model) || null;
     let r;
-    if (!target.baseUrl) {
+    if (!target.baseUrl && upstream.kind !== 'gemini') {
+      // gemini upstreams may omit baseUrl: the transport falls back to
+      // env RELAY_GEMINI_API_BASE or the public Cloud Code default.
       r = { outcome: 'failure', failureKind: 'error', status: 502, mapped: { message: `upstream ${upstream.id} has no baseUrl configured`, type: 'relay_config_error', code: 'missing_base_url' } };
     } else if (upstream.kind === 'passthrough') {
       r = await attemptPassthrough(req, res, rawBody, target.baseUrl);

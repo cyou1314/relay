@@ -936,6 +936,178 @@ try {
     check('card carries both windows', Boolean(stD.quotas[0].windows) && stD.quotas[0].windows.primary.remainingPct === 62 && stD.quotas[0].windows.secondary.remainingPct === 85, JSON.stringify(stD.quotas[0].windows));
     check('two-window human line in the card', stD.quotas[0].detail === '5 小时内还剩 62%，这周还剩 85%', String(stD.quotas[0].detail));
   }
+
+  // =======================================================================
+  // Gemini wiring phase: kind 'gemini' (Google Cloud Code protocol +
+  // OAuth credential file). Everything below runs against a local mock
+  // of the v1internal backend and fixture credential files with dummy
+  // tokens — no real Google request is made and no real credential is
+  // read anywhere in this section.
+  // =======================================================================
+  const GEM_PORT = 18977;
+  const gemDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-gemini-'));
+  start(['test/mock-gemini.js'], { MOCK_GEMINI_PORT: String(GEM_PORT) });
+  await waitHealth(`http://127.0.0.1:${GEM_PORT}/health`);
+  const GEM_BASE = `http://127.0.0.1:${GEM_PORT}/v1internal`;
+  const gemUp = (extra = {}) => ({
+    id: 'gemini-pool', kind: 'gemini', tier: 'subscription', label: 'Gemini', baseUrl: GEM_BASE,
+    model: 'gemini-mock-pro',
+    models: [{ id: 'gemini-mock-flash', capability: 'light' }, { id: 'gemini-mock-pro', capability: 'heavy' }],
+    quota: { source: 'metering', windowTokens: 170 }, ...extra,
+  });
+  const startRoutedEnv = async (port, cfg, log, extraEnv) => {
+    start(['src/gateway.js'], { RELAY_PORT: String(port), RELAY_CONFIG: cfg, RELAY_LOG_FILE: log, RELAY_FEEDBACK_FILE: feedbackFile, ...extraEnv });
+    await waitHealth(`http://127.0.0.1:${port}/health`);
+    return `http://127.0.0.1:${port}`;
+  };
+
+  console.log('test 40: gemini creds — read, refresh via fake HTTP, coded failures');
+  {
+    const credsMod = await import('file://' + path.join(root, 'src/gemini-creds.js'));
+    const { createGeminiCredsService, TOKEN_URL } = credsMod.default;
+    const fakeNow = 1_700_000_000_000;
+    let httpCalls = 0;
+
+    const freshFile = path.join(gemDir, 'creds-fresh.json');
+    fs.writeFileSync(freshFile, JSON.stringify({ access_token: 'FAKE_ACCESS_FRESH', refresh_token: 'FAKE_REFRESH', scope: 'x', token_type: 'Bearer', expiry_date: fakeNow + 3600_000 }));
+    const svcFresh = createGeminiCredsService({ credsPath: freshFile, nowFn: () => fakeNow, httpPost: async () => { httpCalls++; return { status: 500, body: '' }; } });
+    check('fresh token served from the file', (await svcFresh.getAccessToken()) === 'FAKE_ACCESS_FRESH');
+    check('no refresh attempted for a fresh token', httpCalls === 0, `calls=${httpCalls}`);
+
+    const expFile = path.join(gemDir, 'creds-expired.json');
+    fs.writeFileSync(expFile, JSON.stringify({ access_token: 'FAKE_ACCESS_OLD', refresh_token: 'FAKE_REFRESH', token_type: 'Bearer', expiry_date: fakeNow - 1000 }));
+    let seenUrl = null; let seenBody = null;
+    const svcExp = createGeminiCredsService({
+      credsPath: expFile, nowFn: () => fakeNow,
+      httpPost: async (url, bodyStr) => { httpCalls++; seenUrl = url; seenBody = bodyStr; return { status: 200, body: JSON.stringify({ access_token: 'FAKE_ACCESS_NEW', expires_in: 3600, token_type: 'Bearer' }) }; },
+    });
+    check('expired token is refreshed', (await svcExp.getAccessToken()) === 'FAKE_ACCESS_NEW');
+    check('refresh hit the Google token endpoint', seenUrl === TOKEN_URL && seenUrl === 'https://oauth2.googleapis.com/token', String(seenUrl));
+    const form = new URLSearchParams(seenBody || '');
+    check('refresh is a refresh_token grant carrying the file refresh token + client id',
+      form.get('grant_type') === 'refresh_token' && form.get('refresh_token') === 'FAKE_REFRESH' && (form.get('client_id') || '').endsWith('.apps.googleusercontent.com'));
+    const rewritten = JSON.parse(fs.readFileSync(expFile, 'utf8'));
+    check('refreshed token persisted back into the creds file', rewritten.access_token === 'FAKE_ACCESS_NEW' && rewritten.expiry_date === fakeNow + 3600_000 && rewritten.refresh_token === 'FAKE_REFRESH', String(rewritten.expiry_date));
+    const callsAfterRefresh = httpCalls;
+    check('refreshed token is cached (no second HTTP call)', (await svcExp.getAccessToken()) === 'FAKE_ACCESS_NEW' && httpCalls === callsAfterRefresh, `calls=${httpCalls}`);
+
+    const svcMissing = createGeminiCredsService({ credsPath: path.join(gemDir, 'nope.json'), httpPost: async () => { httpCalls++; return { status: 200, body: '{}' }; } });
+    let missingCode = null;
+    try { await svcMissing.getAccessToken(); } catch (e) { missingCode = e.code; }
+    check('missing creds file -> gemini_creds_missing', missingCode === 'gemini_creds_missing', String(missingCode));
+
+    const deadFile = path.join(gemDir, 'creds-dead.json');
+    fs.writeFileSync(deadFile, JSON.stringify({ access_token: 'FAKE_ACCESS_OLD', refresh_token: 'FAKE_REFRESH_DEAD', expiry_date: fakeNow - 1000 }));
+    const svcDead = createGeminiCredsService({ credsPath: deadFile, nowFn: () => fakeNow, httpPost: async () => ({ status: 400, body: '{"error":"invalid_grant","error_description":"Token has been revoked."}' }) });
+    let deadCode = null;
+    try { await svcDead.getAccessToken(); } catch (e) { deadCode = e.code; }
+    check('rejected refresh -> gemini_refresh_failed', deadCode === 'gemini_refresh_failed', String(deadCode));
+
+    const noRefFile = path.join(gemDir, 'creds-norefresh.json');
+    fs.writeFileSync(noRefFile, JSON.stringify({ access_token: 'FAKE_ACCESS_OLD', expiry_date: fakeNow - 1000 }));
+    const svcNoRef = createGeminiCredsService({ credsPath: noRefFile, nowFn: () => fakeNow, httpPost: async () => ({ status: 200, body: '{}' }) });
+    let noRefCode = null;
+    try { await svcNoRef.getAccessToken(); } catch (e) { noRefCode = e.code; }
+    check('expired without refresh token -> gemini_creds_expired', noRefCode === 'gemini_creds_expired', String(noRefCode));
+  }
+
+  const gemCredsFile = path.join(gemDir, 'oauth_creds.json');
+  fs.writeFileSync(gemCredsFile, JSON.stringify({ access_token: 'FAKE_GEMINI_ACCESS', refresh_token: 'FAKE_GEMINI_REFRESH', token_type: 'Bearer', expiry_date: Date.now() + 3600_000 }));
+  const logG = path.join(gemDir, 'routing-g.jsonl');
+  const cfgG = writeCfg('config-g.json', [gemUp(), cheapUp(CHEAP_PORT)], []);
+  const G = await startRoutedEnv(18975, cfgG, logG, { RELAY_GEMINI_CREDS: gemCredsFile });
+
+  console.log('test 41: gemini non-stream — wrapper shape, contents conversion, usage, tool call');
+  {
+    const { status, json } = await routedPost(G, { model: 'gemini-mock-pro', input: 'say hello', stream: false });
+    check('status 200', status === 200, `got ${status} ${JSON.stringify(json).slice(0, 200)}`);
+    check('text from gemini mock', textOf(json) === 'Hello from gemini mock.', textOf(json));
+    check('usage mapped from usageMetadata (11/6/17)', Boolean(json.usage) && json.usage.input_tokens === 11 && json.usage.output_tokens === 6 && json.usage.total_tokens === 17, JSON.stringify(json.usage));
+    const last = await (await fetch(`http://127.0.0.1:${GEM_PORT}/__last`)).json();
+    check('mock saw the OAuth bearer taken from the creds file', last.authorization === 'Bearer FAKE_GEMINI_ACCESS', String(last.authorization));
+    check('wrapper: model outside request, contents inside', Boolean(last.body) && typeof last.body.model === 'string' && Boolean(last.body.request) && Array.isArray(last.body.request.contents), JSON.stringify(last.body).slice(0, 160));
+    check('light task dispatched to the light model (capability axis)', last.body.model === 'gemini-mock-flash', String(last.body && last.body.model));
+    check('contents converted (single user text turn)', last.body.request.contents.length === 1 && last.body.request.contents[0].role === 'user' && last.body.request.contents[0].parts[0].text === 'say hello', JSON.stringify(last.body.request.contents).slice(0, 160));
+    const e = await lastAttemptWait(logG);
+    check('log chosen gemini-pool, servedModel matches dispatch', Boolean(e) && e.chosen === 'gemini-pool' && e.servedModel === 'gemini-mock-flash', JSON.stringify(e));
+
+    const tool = await routedPost(G, { model: 'gemini-mock-pro', input: 'CALL_TOOL please', tools: TOOLS, stream: false });
+    const fc = (tool.json.output || []).find((o) => o.type === 'function_call');
+    check('gemini functionCall -> Responses function_call', Boolean(fc) && fc.name === 'run_echo', JSON.stringify(tool.json.output));
+    let argsOk = false; try { argsOk = JSON.parse(fc.arguments).text === 'hello-from-tool'; } catch {}
+    check('functionCall args object -> arguments JSON string', argsOk, fc && fc.arguments);
+    const lastTool = await (await fetch(`http://127.0.0.1:${GEM_PORT}/__last`)).json();
+    check('tools converted to functionDeclarations', JSON.stringify((lastTool.body.request || {}).tools || []).includes('run_echo'), JSON.stringify((lastTool.body.request || {}).tools).slice(0, 160));
+  }
+
+  console.log('test 41b: gemini tool-result roundtrip — functionResponse under role user');
+  {
+    const input = [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'read the file' }] },
+      { type: 'function_call', call_id: 'call_x', name: 'run_echo', arguments: '{"text":"hi"}' },
+      { type: 'function_call_output', call_id: 'call_x', output: 'file-contents-xyz' },
+    ];
+    const { status } = await routedPost(G, { model: 'gemini-mock-pro', input, tools: TOOLS, stream: false });
+    check('status 200', status === 200, `got ${status}`);
+    const last = await (await fetch(`http://127.0.0.1:${GEM_PORT}/__last`)).json();
+    const contents = last.body.request.contents;
+    const fr = contents.flatMap((c) => (c.parts || []).filter((p) => p.functionResponse).map((p) => ({ role: c.role, fr: p.functionResponse })));
+    check('functionResponse present under role user, named from the call', fr.length === 1 && fr[0].role === 'user' && fr[0].fr.name === 'run_echo', JSON.stringify(fr).slice(0, 200));
+    check('functionResponse carries the tool output', fr.length === 1 && JSON.stringify(fr[0].fr.response).includes('file-contents-xyz'), JSON.stringify(fr).slice(0, 200));
+    const modelTurn = contents.find((c) => c.role === 'model');
+    check('the call itself is a model functionCall part with parsed args', Boolean(modelTurn) && (modelTurn.parts || []).some((p) => p.functionCall && p.functionCall.name === 'run_echo' && p.functionCall.args.text === 'hi'), JSON.stringify(contents).slice(0, 240));
+  }
+
+  console.log('test 42: gemini streaming — SSE converted, deltas assemble, usage lands');
+  {
+    const r = await fetch(`${G}/v1/responses`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gemini-mock-pro', input: 'say hello', stream: true }) });
+    const raw = await r.text();
+    const events = [];
+    for (const block of raw.split('\n\n')) {
+      const line = block.split('\n').find((l) => l.startsWith('data:'));
+      if (!line) continue;
+      const data = line.slice(5).trim();
+      if (data && data !== '[DONE]') events.push(JSON.parse(data));
+    }
+    const types = events.map((e) => e.type);
+    check('status 200', r.status === 200, `got ${r.status}`);
+    check('first event response.created, last response.completed', types[0] === 'response.created' && types[types.length - 1] === 'response.completed', types.join(','));
+    const deltas = events.filter((e) => e.type === 'response.output_text.delta').map((e) => e.delta).join('');
+    check('delta concat = full gemini text', deltas === 'Hello from gemini mock.', deltas);
+    const completed = events[events.length - 1].response;
+    check('completed usage from usageMetadata (17)', Boolean(completed.usage) && completed.usage.total_tokens === 17, JSON.stringify(completed.usage));
+  }
+
+  console.log('test 43: gemini creds missing — auth failure falls back (fallback_auth), pool unaffected');
+  {
+    const logG2 = path.join(gemDir, 'routing-g2.jsonl');
+    const cfgG2 = writeCfg('config-g2.json', [gemUp(), cheapUp(CHEAP_PORT)], []);
+    const G2 = await startRoutedEnv(18976, cfgG2, logG2, { RELAY_GEMINI_CREDS: path.join(gemDir, 'absent-creds.json') });
+    const { status, json } = await routedPost(G2, { model: 'gemini-mock-pro', input: 'say hello', stream: false });
+    check('status 200 via fallback', status === 200, `got ${status}`);
+    check('served by cheap API', textOf(json) === 'Hello from cheap upstream.', textOf(json));
+    await settleLog(logG2);
+    const es = entriesOf(logG2);
+    const reqId = es[es.length - 1].requestId;
+    const attempts = es.filter((e) => e.requestId === reqId);
+    check('two attempts logged for one request', attempts.length === 2, `got ${attempts.length}`);
+    check('attempt 1: gemini-pool, 401, initial', attempts.length === 2 && attempts[0].chosen === 'gemini-pool' && attempts[0].status === 401 && attempts[0].reasonCode === 'initial', JSON.stringify(attempts[0]));
+    check('attempt 2: cheap, fallback_auth, 200', attempts.length === 2 && attempts[1].chosen === 'cheap-api' && attempts[1].reasonCode === 'fallback_auth' && attempts[1].status === 200, JSON.stringify(attempts[1]));
+  }
+
+  console.log('test 44: gemini quota stays metering-estimate (honest label), driven by the routing log');
+  {
+    const quotaMod = await import('file://' + path.join(root, 'src/quota.js'));
+    const upModG = await import('file://' + path.join(root, 'src/upstreams.js'));
+    const cfg = JSON.parse(fs.readFileSync(cfgG, 'utf8'));
+    const svc = quotaMod.default.createQuotaService({ config: cfg, registry: upModG.default.createRegistry(cfg), logFile: logG });
+    await settleLog(logG);
+    const q = svc.getQuota('gemini-pool');
+    check('source is metering-estimate', q.source === 'metering-estimate', JSON.stringify(q));
+    // logG holds 4 successful gemini responses at 17 tokens each = 68
+    // of the 170-token window -> 60% remaining.
+    check('estimate reflects metered tokens (68/170 -> 60%)', Math.abs((q.remainingPct ?? -1) - 60) < 1e-9, JSON.stringify(q));
+  }
 } catch (err) {
   failed++;
   console.log('FATAL', err && err.stack || err);

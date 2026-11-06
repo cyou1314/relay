@@ -22,7 +22,7 @@ const REPO_ROOT = path.join(__dirname, '..');
 const DEFAULT_CONFIG_PATH = path.join(REPO_ROOT, 'relay.config.json');
 
 const TIERS = ['subscription', 'cheap-api', 'premium-api'];
-const KINDS = ['passthrough', 'chat'];
+const KINDS = ['passthrough', 'chat', 'gemini'];
 const CAPABILITIES = ['light', 'standard', 'heavy'];
 
 /**
@@ -63,7 +63,13 @@ function normalizeUpstream(raw, idx) {
     tier,
     // chat kind: base URL of an OpenAI-compatible /v1 root.
     // passthrough kind: full URL of the Responses endpoint to forward to.
+    // gemini kind: optional Cloud Code API base override
+    //   (…/v1internal); null = env RELAY_GEMINI_API_BASE or the public
+    //   default. `project` (gemini kind): the cloudaicompanion project
+    //   id from the onboarding step, sent in the request wrapper when
+    //   set; null = omitted (see docs/GEMINI-REPORT.md).
     baseUrl: typeof raw.baseUrl === 'string' ? raw.baseUrl.replace(/\/+$/, '') : null,
+    project: typeof raw.project === 'string' ? raw.project : null,
     apiKeyEnv: typeof raw.apiKeyEnv === 'string' ? raw.apiKeyEnv : null,
     // Model to send upstream; null = pass the client's requested model through.
     model: typeof raw.model === 'string' ? raw.model : null,

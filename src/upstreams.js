@@ -9,6 +9,10 @@
  * those protocols:
  *   kind 'passthrough' -> forward the raw Responses request to baseUrl
  *   kind 'chat'        -> translate to Chat Completions at baseUrl + '/chat/completions'
+ *   kind 'gemini'      -> translate to Google's Cloud Code protocol
+ *                         (src/gemini.js) with the OAuth credential from
+ *                         src/gemini-creds.js; baseUrl optionally
+ *                         overrides the v1internal API base
  *
  * resolveTarget(upstream) turns a registry entry into concrete dispatch
  * parameters, reading the API key from the environment variable NAMED by
@@ -53,6 +57,7 @@ function resolveTarget(upstream) {
     baseUrl: upstream.baseUrl,
     apiKey: upstream.apiKeyEnv ? (process.env[upstream.apiKeyEnv] || '') : '',
     model: upstream.model,
+    project: upstream.project || null,
   };
 }
 
