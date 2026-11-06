@@ -233,64 +233,119 @@
   })();
 </script>
 <script>
-  // 粒子：细灰银尘埃缓慢漂浮，营造质感。无连线。
-  // 参数：密度约每万像素 0.8 个（上限 90）；半径 1–2.5px（约 8% 为大半径低透明光晕）；
-  //       透明度 0.15–0.5（光晕 0.04–0.07）；速度 3–11 px/s + 正弦轻浮；灰阶 100–165。
-  // 鼠标视差：整层偏移 ±4px 以内，按粒子深度缩放，lerp 平滑跟随。
-  // prefers-reduced-motion 时只画一帧静态、不启动画循环（与本页其他动画的降级策略一致）。
+  // 粒子：三层景深的「光尘」——离屏径向渐变精灵（白芯→中性灰→全透明）用 drawImage 绘制，
+  // 单个粒子是一团柔光，没有硬边。纯灰银、无任何色相、无连线。
+  // 分层（总量更少更稀疏，上限 55，宁缺毋滥）：
+  //   远层 ~60%：显示半径 1–2px、较实（0.25–0.45）、速度最慢——细尘；
+  //   中层 ~30%：显示半径 3–5px 柔光（0.12–0.25）；
+  //   近层 4–7 个：显示半径 8–16px 的大团虚光（0.05–0.10），bokeh 镜头虚化感，是质感来源。
+  // 呼吸：每粒透明度正弦微闪（周期 4–9s、幅度 ±25%），大小同步 ±10%，相位随机，像光在呼吸。
+  // 运动：以极慢上浮为主（热气流微尘）+ 横向正弦摇曳；近层位移大于远层，视差自然成立；
+  //       鼠标视差按层深缩放（远 ±1 / 中 ±3 / 近 ±6 px），lerp 平滑。
+  // 分布：2–3 个高斯聚集的疏松「尘团」（约 68% 粒子）+ 少量散点，留白区域就是留白。
+  // 性能/无障碍沿用旧策略：DPR≤2、页面隐藏暂停；prefers-reduced-motion 时不启循环，
+  // 只画一帧静态图（静态帧同样是分层构图，不是均匀散点）。
   (function(){
     var cv = document.getElementById('dust');
     if (!cv || !cv.getContext) return;
     var ctx = cv.getContext('2d');
     var W = 0, H = 0, parts = [], raf = null;
-    var mx = .5, my = .5, ox = 0, oy = 0; // 鼠标目标与当前视差偏移
+    var mx = .5, my = .5, ox = 0, oy = 0; // 鼠标目标与当前视差偏移（归一化 -1..1，绘制时按层缩放）
     var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // 离屏精灵图：径向渐变，RGB 三通道相等（严格中性灰），边缘完全透明
+    var SPR = 128, sprite = document.createElement('canvas');
+    sprite.width = sprite.height = SPR;
+    (function(){
+      var c = sprite.getContext('2d');
+      var g = c.createRadialGradient(SPR/2, SPR/2, 0, SPR/2, SPR/2, SPR/2);
+      g.addColorStop(0,    'rgba(252,252,252,1)');
+      g.addColorStop(0.25, 'rgba(230,230,230,0.55)');
+      g.addColorStop(0.6,  'rgba(200,200,200,0.16)');
+      g.addColorStop(1,    'rgba(192,192,192,0)');
+      c.fillStyle = g;
+      c.fillRect(0, 0, SPR, SPR);
+    })();
+
+    function gauss(){ // Box–Muller 标准正态
+      var u = 0, v = 0;
+      while (!u) u = Math.random();
+      while (!v) v = Math.random();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+    function rnd(a, b){ return a + Math.random() * (b - a); }
+
+    var LAYERS = [
+      { share:0.60, disp:[1, 2],  a:[0.25, 0.45], spd:[1.5, 4], par:1 }, // 远
+      { share:0.30, disp:[3, 5],  a:[0.12, 0.25], spd:[4, 8],   par:3 }, // 中
+      { share:0.10, disp:[8, 16], a:[0.05, 0.10], spd:[3, 6],   par:6 }  // 近
+    ];
 
     function build(){
       var dpr = Math.min(window.devicePixelRatio || 1, 2);
       W = window.innerWidth; H = window.innerHeight;
       cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      var n = Math.min(90, Math.max(24, Math.round(W * H / 10000 * 0.8)));
-      parts = [];
-      for (var i = 0; i < n; i++){
-        var glow = Math.random() < 0.08;
-        var ang = Math.random() * Math.PI * 2;
-        var spd = 3 + Math.random() * 8; // px/s
-        parts.push({
-          x: Math.random() * W, y: Math.random() * H,
-          r: glow ? 6 + Math.random() * 5 : 1 + Math.random() * 1.5,
-          a: glow ? 0.04 + Math.random() * 0.03 : 0.15 + Math.random() * 0.35,
-          g: 100 + Math.round(Math.random() * 65),
-          vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 1.5,
-          ph: Math.random() * Math.PI * 2,       // 浮动相位
-          fa: 4 + Math.random() * 7,             // 浮动幅度 px
-          depth: 0.4 + Math.random() * 0.6       // 视差深度
+      var total = Math.min(55, Math.max(22, Math.round(W * H / 10000 * 0.38)));
+      var nc = 2 + (Math.random() < 0.5 ? 1 : 0), clusters = [];
+      for (var i = 0; i < nc; i++){
+        clusters.push({
+          x: rnd(0.15, 0.85) * W, y: rnd(0.15, 0.85) * H,
+          sx: W * rnd(0.10, 0.18), sy: H * rnd(0.12, 0.20)
         });
       }
+      parts = [];
+      LAYERS.forEach(function(L, li){
+        var n = Math.round(total * L.share);
+        if (li === 2) n = Math.max(4, Math.min(7, n)); // 近层只许 4–7 个
+        for (var i = 0; i < n; i++){
+          var x, y;
+          if (Math.random() < 0.68){
+            var cl = clusters[(Math.random() * clusters.length) | 0];
+            x = cl.x + gauss() * cl.sx;
+            y = cl.y + gauss() * cl.sy;
+          } else {
+            x = Math.random() * W; y = Math.random() * H;
+          }
+          parts.push({
+            par: L.par, x: x, y: y,
+            spr: rnd(L.disp[0], L.disp[1]) / 0.38, // 精灵半边长：亮芯约占半径 38%，折算到目标显示半径
+            a: rnd(L.a[0], L.a[1]),
+            vy: -rnd(L.spd[0], L.spd[1]),         // 负值 = 缓慢上浮
+            swayA: rnd(6, 16),                     // 横向摇曳幅度 px
+            swayT: rnd(9000, 18000),               // 摇曳周期 ms
+            brT: rnd(4000, 9000),                  // 呼吸周期 4–9s
+            ph: Math.random() * Math.PI * 2
+          });
+        }
+      });
     }
+
     function draw(now){
       ctx.clearRect(0, 0, W, H);
       for (var i = 0; i < parts.length; i++){
         var p = parts[i];
-        var fx = Math.sin(now / 2600 + p.ph) * p.fa * 0.35;
-        var fy = Math.cos(now / 3200 + p.ph) * p.fa * 0.25;
-        ctx.beginPath();
-        ctx.arc(p.x + fx + ox * p.depth, p.y + fy + oy * p.depth, p.r, 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(' + p.g + ',' + p.g + ',' + (p.g + 6) + ',' + p.a + ')';
-        ctx.fill();
+        var br = Math.sin(now / p.brT * Math.PI * 2 + p.ph);
+        var size = p.spr * (1 + 0.10 * br);
+        var x = p.x + Math.sin(now / p.swayT * Math.PI * 2 + p.ph) * p.swayA + ox * p.par;
+        var y = p.y + oy * p.par;
+        ctx.globalAlpha = Math.max(0, Math.min(1, p.a * (1 + 0.25 * br)));
+        ctx.drawImage(sprite, x - size, y - size, size * 2, size * 2);
       }
+      ctx.globalAlpha = 1;
     }
+
     var last = 0;
     function tick(ts){
       var dt = Math.min((ts - last) / 1000 || 0.016, 0.05); last = ts;
-      ox += ((mx - .5) * 8 - ox) * 0.03; // ±4px，lerp 平滑
-      oy += ((my - .5) * 8 - oy) * 0.03;
+      ox += ((mx - .5) * 2 - ox) * 0.03; // ±1，绘制时按层深得到 ±1/3/6 px
+      oy += ((my - .5) * 2 - oy) * 0.03;
       for (var i = 0; i < parts.length; i++){
         var p = parts[i];
-        p.x += p.vx * dt; p.y += p.vy * dt;
-        if (p.x < -12) p.x = W + 12; else if (p.x > W + 12) p.x = -12;
-        if (p.y < -12) p.y = H + 12; else if (p.y > H + 12) p.y = -12;
+        p.y += p.vy * dt;
+        var m = p.spr + 24;
+        if (p.y < -m){ p.y = H + m; p.x = Math.random() * W; } // 浮出顶部后从底部随机处再入
+        if (p.x < -m) p.x = W + m; else if (p.x > W + m) p.x = -m;
       }
       draw(ts);
       raf = requestAnimationFrame(tick);
@@ -299,7 +354,7 @@
     function stop(){ if (raf) cancelAnimationFrame(raf); raf = null; }
 
     build();
-    draw(1200); // 先画一帧，降级/静态时也有尘埃感
+    draw(1200); // 先画一帧：静态/降级时也是分层光尘构图
     start();
     window.addEventListener('resize', function(){ build(); draw(1200); });
     window.addEventListener('mousemove', function(e){
