@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Relay 网关 launchd LaunchAgent 模板。直接 load 本文件无效：先按
+  deploy/DEPLOY-MAC.md 第 3 步把三个占位符替换成真值再安装：
+    __RELAY_DIR__  Relay 在 Mac 上的目录（清单默认 ~/relay）
+    __NODE_BIN__   node 可执行文件绝对路径（本机为 /Users/cyou/node/bin/node）
+    __HOME__       用户 home 绝对路径（日志路径用）
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.muse.relay</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_BIN__</string>
+    <string>__RELAY_DIR__/src/gateway.js</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__RELAY_DIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RELAY_CONFIG</key>
+    <string>__RELAY_DIR__/deploy/relay.config.json</string>
+    <key>RELAY_PORT</key>
+    <string>18923</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/relay-gateway.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/relay-gateway.log</string>
+</dict>
+</plist>
