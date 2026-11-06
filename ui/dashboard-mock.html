@@ -1,162 +1,168 @@
 <!doctype html>
-<!-- Relay dashboard — DESIGN MOCK with fixture data only (no live wiring).
-     Open by double-clicking. Fixture method borrowed from AutoRouter:
-     the UI can be reviewed end-to-end without touching real data.
-     The live dashboard (PLAN M4) binds these same panels to
-     GET /v1/models, the routing log and src/ledger.js output. -->
-<html lang="en">
+<!-- Relay 仪表盘 — 设计稿（示例数据，双击即可打开看效果）。
+     原则：不懂技术的人 3 秒看懂三件事——还剩多少额度、今天花了多少钱、刚用了哪个模型。 -->
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>Relay — Dashboard (design mock)</title>
+<title>Relay — 仪表盘（设计稿）</title>
 <style>
   :root{
-    --bg:#0d0f11; --panel:#15181b; --panel2:#1a1e22; --line:#262b30;
-    --fg:#e6e8ea; --muted:#9aa3ab; --faint:#6b747c;
-    --green:#4caf7d; --amber:#d9a441; --red:#d96a5f; --blue:#5b9bd5;
-    --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
-    --sans:-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+    --bg:#f5f5f7;
+    --card:#ffffff;
+    --ink:#1d1d1f;
+    --sub:#6e6e73;
+    --faint:#86868b;
+    --hair:rgba(0,0,0,.07);
+    --blue:#0071e3;
+    --green:#34c759;
+    --orange:#ff9500;
+    --track:#e8e8ed;
+    --sans:-apple-system,BlinkMacSystemFont,'SF Pro Text','PingFang SC','Helvetica Neue',Helvetica,Arial,sans-serif;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 var(--sans)}
-  header{display:flex;align-items:baseline;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line)}
-  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.02em}
-  header .sub{color:var(--muted)}
-  header .mock{margin-left:auto;color:var(--amber);border:1px solid var(--amber);border-radius:4px;padding:1px 8px;font-size:11px}
-  .status{color:var(--green)} .status::before{content:'● '}
-  main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;max-width:1180px;margin:0 auto}
-  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
-  .card h3{margin:0 0 8px;font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.06em}
-  .big{font:600 26px var(--mono)}
-  .bar{height:6px;background:var(--panel2);border-radius:3px;margin:8px 0 6px;overflow:hidden}
-  .bar i{display:block;height:100%;background:var(--green)}
-  .bar i.warn{background:var(--amber)} .bar i.low{background:var(--red)}
-  .rowline{display:flex;justify-content:space-between;color:var(--muted);font-size:12px}
-  .rowline b{color:var(--fg);font-family:var(--mono);font-weight:500}
-  .badge{display:inline-block;border:1px solid var(--line);border-radius:4px;padding:0 6px;font-size:11px;color:var(--muted)}
-  .badge.est{color:var(--amber);border-color:var(--amber)}
-  section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
-  section h2{margin:0 0 10px;font-size:13px;font-weight:600}
-  table{width:100%;border-collapse:collapse;font-size:12.5px}
-  th{color:var(--faint);text-align:left;font-weight:500;padding:4px 8px;border-bottom:1px solid var(--line)}
-  td{padding:5px 8px;border-bottom:1px solid #1d2126;font-family:var(--mono);white-space:nowrap}
-  td.plain{font-family:var(--sans)}
-  tr:last-child td{border-bottom:none}
-  .chip{display:inline-block;border-radius:4px;padding:0 6px;font-size:11px;background:var(--panel2);border:1px solid var(--line);color:var(--fg)}
-  .chip.fb{color:var(--amber)} .chip.pin{color:var(--blue)} .chip.sens{color:var(--red)}
-  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .total{font:600 20px var(--mono)}
-  .rules{list-style:none;margin:0;padding:0}
-  .rules li{padding:6px 0;border-bottom:1px solid #1d2126;display:flex;gap:10px;align-items:baseline}
-  .rules li:last-child{border-bottom:none}
-  .rules code{font-family:var(--mono);color:var(--fg)}
-  .rules span{color:var(--muted)}
-  footer{color:var(--faint);font-size:12px;padding:0 20px 18px;max-width:1180px;margin:0 auto}
+  html{-webkit-font-smoothing:antialiased}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.7 var(--sans)}
+  .wrap{max-width:880px;margin:0 auto;padding:44px 28px 40px}
+
+  header{display:flex;align-items:baseline;gap:14px;margin-bottom:30px}
+  header h1{font-size:32px;line-height:1.1;font-weight:700;letter-spacing:-.02em;margin:0}
+  header .sub{color:var(--sub);font-size:15px}
+  header .mock{margin-left:auto;font-size:12px;font-weight:600;color:#b34700;background:rgba(255,149,0,.12);border-radius:999px;padding:3px 12px;white-space:nowrap}
+  .statusline{display:flex;align-items:center;gap:8px;color:var(--sub);font-size:14px;margin:-18px 0 26px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--green);flex:none}
+
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-bottom:20px}
+  .card{background:var(--card);border-radius:20px;padding:24px 26px;
+    box-shadow:0 1px 2px rgba(0,0,0,.03),0 10px 30px rgba(0,0,0,.04)}
+  .card h3{margin:0 0 12px;font-size:15px;font-weight:600;color:var(--sub)}
+  .big{font-size:42px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1.05}
+  .big .unit{font-size:22px;font-weight:600;color:var(--sub)}
+  .bar{height:7px;background:var(--track);border-radius:4px;margin:16px 0 12px;overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--blue);border-radius:4px}
+  .hint{color:var(--sub);font-size:14px;line-height:1.6}
+  .tag{display:inline-block;border-radius:999px;padding:1px 10px;font-size:12px;font-weight:600;color:#b34700;background:rgba(255,149,0,.12);margin-left:8px;vertical-align:5px}
+
+  .summary{background:var(--card);border-radius:20px;padding:22px 26px;margin-bottom:20px;
+    box-shadow:0 1px 2px rgba(0,0,0,.03),0 10px 30px rgba(0,0,0,.04)}
+  .summary p{margin:0;font-size:18px}
+  .summary b{font-weight:700}
+
+  section{background:var(--card);border-radius:20px;padding:24px 26px;margin-bottom:20px;
+    box-shadow:0 1px 2px rgba(0,0,0,.03),0 10px 30px rgba(0,0,0,.04)}
+  section h2{margin:0 0 8px;font-size:19px;font-weight:600;letter-spacing:-.01em}
+  .item{display:flex;gap:16px;align-items:baseline;padding:13px 0;border-bottom:1px solid var(--hair)}
+  .item:last-child{border-bottom:none;padding-bottom:2px}
+  .item .time{color:var(--faint);font-size:14px;font-variant-numeric:tabular-nums;flex:none;width:52px}
+  .item .main{flex:1;min-width:0}
+  .item .model{font-weight:600;font-size:16px}
+  .badge{display:inline-block;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:600;margin-left:8px;vertical-align:2px}
+  .badge.easy{color:var(--sub);background:var(--bg)}
+  .badge.normal{color:#0057b8;background:rgba(0,113,227,.09)}
+  .badge.hard{color:#b34700;background:rgba(255,149,0,.13)}
+  .item .why{color:var(--sub);font-size:14.5px;line-height:1.55}
+  .item .cost{flex:none;font-weight:600;font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .item .cost.quota{color:var(--sub);font-weight:500}
+
+  .strategy{color:var(--sub);font-size:15.5px;line-height:1.7;padding:2px 6px 0}
+  .strategy b{color:var(--ink);font-weight:600}
+  footer{color:var(--faint);font-size:13px;padding:10px 6px 0}
+  @media (max-width:760px){ .cards{grid-template-columns:1fr} }
 </style>
 </head>
 <body>
-<header>
-  <h1>Relay</h1>
-  <span class="sub">Local model router</span>
-  <span class="status">gateway up · routed mode · 4 upstreams</span>
-  <span class="mock">DESIGN MOCK — fixture data</span>
-</header>
-<main>
-  <!-- Quota cards -->
+<div class="wrap">
+  <header>
+    <h1>Relay</h1>
+    <span class="sub">我的模型管家</span>
+    <span class="mock">设计稿 · 示例数据</span>
+  </header>
+  <div class="statusline"><span class="dot"></span>正在运行，一切正常</div>
+
+  <!-- 区块 1：还剩多少 / 花了多少 -->
   <div class="cards">
     <div class="card">
-      <h3>ChatGPT plan — Codex · 5h window</h3>
-      <div class="big">62%</div>
+      <h3>Codex 剩余额度</h3>
+      <div class="big">62<span class="unit">%</span></div>
       <div class="bar"><i style="width:62%"></i></div>
-      <div class="rowline"><span>resets in</span><b>1h 24m</b></div>
-      <div class="rowline"><span>source</span><b>official usage endpoint</b></div>
+      <div class="hint">下午 2:24 恢复满格</div>
     </div>
     <div class="card">
-      <h3>ChatGPT plan — Codex · weekly</h3>
-      <div class="big">81%</div>
-      <div class="bar"><i style="width:81%"></i></div>
-      <div class="rowline"><span>resets</span><b>Sun 00:00</b></div>
-      <div class="rowline"><span>source</span><b>official usage endpoint</b></div>
+      <h3>Gemini 剩余额度</h3>
+      <div class="big">74<span class="unit">%</span><span class="tag">估算</span></div>
+      <div class="bar"><i style="width:74%;background:var(--orange)"></i></div>
+      <div class="hint">够用，不用省着</div>
     </div>
     <div class="card">
-      <h3>Gemini pool — Antigravity</h3>
-      <div class="big">74% <span class="badge est">estimate</span></div>
-      <div class="bar"><i class="warn" style="width:74%"></i></div>
-      <div class="rowline"><span>metered by gateway</span><b>261,400 tok</b></div>
-      <div class="rowline"><span>source</span><b>metering-estimate</b></div>
+      <h3>API 今天已花费</h3>
+      <div class="big"><span class="unit">¥</span>1.32</div>
+      <div class="hint" style="margin-top:16px">大部分时候用的是订阅额度，没花钱</div>
     </div>
   </div>
 
-  <!-- Live routing stream -->
-  <section>
-    <h2>Routing — live</h2>
-    <table>
-      <thead><tr>
-        <th>Time</th><th>Project</th><th>Model → Upstream</th><th>Reason</th><th>Tokens</th><th>Book</th><th></th>
-      </tr></thead>
-      <tbody id="stream"></tbody>
-    </table>
-  </section>
-
-  <div class="grid2">
-    <!-- Dual ledger -->
-    <section>
-      <h2>Cash book — pay-as-you-go APIs</h2>
-      <div class="total">$3.2741</div>
-      <table>
-        <thead><tr><th>Upstream</th><th>Requests</th><th>Tokens</th><th>USD</th></tr></thead>
-        <tbody>
-          <tr><td>deepseek-api</td><td>41</td><td>812,300</td><td>$0.1834</td></tr>
-          <tr><td>premium-api</td><td>6</td><td>204,750</td><td>$3.0907</td></tr>
-        </tbody>
-      </table>
-      <p style="color:var(--muted);margin:10px 0 0">Money that actually left the wallet, priced from the config price table. Subscription turns never appear here.</p>
-    </section>
-    <section>
-      <h2>Quota book — subscriptions</h2>
-      <div class="total">1,942,600 tok</div>
-      <table>
-        <thead><tr><th>Upstream</th><th>Requests</th><th>Tokens</th><th>Remaining</th></tr></thead>
-        <tbody>
-          <tr><td>codex-plan</td><td>128</td><td>1,681,200</td><td>62% · official</td></tr>
-          <tr><td>gemini-pool</td><td>37</td><td>261,400</td><td>74% · estimate</td></tr>
-        </tbody>
-      </table>
-      <p style="color:var(--muted);margin:10px 0 0">Sunk-cost quota burned instead of cash. Feedback so far: 👍 23 · 👎 2.</p>
-    </section>
+  <!-- 区块 2：今日小结 -->
+  <div class="summary">
+    <p>今天一共用了 <b>23 次</b>，其中 19 次走订阅额度没花钱，帮你省下约 <b>¥12</b>（估算）。</p>
   </div>
 
-  <!-- Rules -->
+  <!-- 区块 3：最近动态 -->
   <section>
-    <h2>Rules</h2>
-    <ul class="rules" id="rules"></ul>
+    <h2>最近动态</h2>
+    <div class="item">
+      <span class="time">13:02</span>
+      <div class="main">
+        <span class="model">GPT-6 Luna</span><span class="badge normal">普通</span>
+        <div class="why">常规任务，用的订阅额度</div>
+      </div>
+      <span class="cost quota">用额度</span>
+    </div>
+    <div class="item">
+      <span class="time">12:58</span>
+      <div class="main">
+        <span class="model">DeepSeek Lite</span><span class="badge easy">简单</span>
+        <div class="why">任务简单，省着用额度，换了便宜的</div>
+      </div>
+      <span class="cost">¥0.01</span>
+    </div>
+    <div class="item">
+      <span class="time">12:41</span>
+      <div class="main">
+        <span class="model">GPT-6 Sol</span><span class="badge hard">复杂</span>
+        <div class="why">任务复杂，给了最强的</div>
+      </div>
+      <span class="cost quota">用额度</span>
+    </div>
+    <div class="item">
+      <span class="time">12:20</span>
+      <div class="main">
+        <span class="model">DeepSeek Chat</span><span class="badge normal">普通</span>
+        <div class="why">订阅额度不够了，换了便宜的顶上</div>
+      </div>
+      <span class="cost">¥0.05</span>
+    </div>
+    <div class="item">
+      <span class="time">11:57</span>
+      <div class="main">
+        <span class="model">Gemini 3.1 Pro</span><span class="badge hard">复杂</span>
+        <div class="why">刚才那家出故障了，自动换了一家</div>
+      </div>
+      <span class="cost quota">用额度</span>
+    </div>
+    <div class="item">
+      <span class="time">11:32</span>
+      <div class="main">
+        <span class="model">GPT-6 Luna</span><span class="badge easy">简单</span>
+        <div class="why">任务简单，额度也够，就用订阅的</div>
+      </div>
+      <span class="cost quota">用额度</span>
+    </div>
   </section>
-</main>
-<footer>Fixture data for design review. Panels map 1:1 to ledger summary output and the routing log schema (requestId / chosen / reasonCode / quota snapshot).</footer>
 
-<script>
-const STREAM = [
-  {t:'11:02:41', proj:'relay',          route:'gpt-6-luna → codex-plan',    reason:'initial',          tok:'48,210', book:'quota', fb:'👍'},
-  {t:'11:02:18', proj:'relay',          route:'gpt-6-luna → codex-plan',    reason:'sticky_session',   tok:'47,980', book:'quota', fb:''},
-  {t:'11:01:57', proj:'secret-proj',    route:'gpt-6-luna → gemini-pool',   reason:'initial',          tok:'12,340', book:'quota', fb:''},
-  {t:'11:01:12', proj:'wuxian',         route:'gpt-6-luna → deepseek-api',  reason:'fallback_quota',   tok:'8,120',  book:'$0.0021', fb:'👍'},
-  {t:'11:00:44', proj:'always-flagship',route:'gpt-6-luna → premium-api',   reason:'pinned',           tok:'51,030', book:'$0.6639', fb:''},
-  {t:'10:59:31', proj:'synccut',        route:'gpt-6-luna → deepseek-api',  reason:'fallback_filtered',tok:'6,540',  book:'$0.0017', fb:'👎'},
-  {t:'10:58:03', proj:'relay',          route:'— refused —',                reason:'sensitive_block',  tok:'0',      book:'—', fb:''},
-];
-const chipClass = (r) => r.startsWith('fallback') ? 'chip fb' : r === 'pinned' ? 'chip pin' : r === 'sensitive_block' ? 'chip sens' : 'chip';
-document.getElementById('stream').innerHTML = STREAM.map((r) => `
-  <tr>
-    <td>${r.t}</td><td class="plain">${r.proj}</td><td>${r.route}</td>
-    <td><span class="${chipClass(r.reason)}">${r.reason}</span></td>
-    <td>${r.tok}</td><td>${r.book}</td><td>${r.fb}</td>
-  </tr>`).join('');
-const RULES = [
-  {code:'/work/secret-proj', desc:'sensitive — subscription upstreams only, fail closed', chip:'<span class="chip sens">sensitive</span>'},
-  {code:'/work/always-flagship', desc:'pinned to premium-api', chip:'<span class="chip pin">pin</span>'},
-  {code:'(default)', desc:'quota-first: subscription → cheap API → premium API; sessions stick', chip:'<span class="chip">auto</span>'},
-];
-document.getElementById('rules').innerHTML = RULES.map((r) => `<li><code>${r.code}</code><span>${r.desc}</span>${r.chip}</li>`).join('');
-</script>
+  <!-- 区块 4：现在的做法 -->
+  <div class="strategy">
+    <b>现在的做法：</b>先用快要到期的订阅额度，尽量不花钱；任务复杂的才用最强的模型；哪家出问题就自动换一家，你不用管。
+  </div>
+
+  <footer>这是设计稿，数字都是举例。正式版会换成你的真实数据。</footer>
+</div>
 </body>
 </html>

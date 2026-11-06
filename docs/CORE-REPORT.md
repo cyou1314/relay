@@ -164,6 +164,13 @@ the final phase should take them:
    `~/.codex`, launchd daemon (M4), the full-day no-broken-stream
    acceptance, and dashboard live wiring (M4) on top of the approved
    mock in §5.
+6. **API balance query (PLAN §3.3):** where an API provider exposes a
+   balance/credit endpoint, wire it as a quota source for API-tier
+   upstreams (`source: 'api-balance'`) so the cash book gains a
+   provider-side cross-check; consumption-only accounting stays the
+   fallback where no such endpoint exists. *(This item was dropped from
+   this checklist when the core phase closed and was restored by the
+   2026-11-06 gap audit — see `docs/GAP-AUDIT.md`.)*
 
 Known limitations carried forward: routed passthrough keeps no internal
 retry (the fallback chain owns recovery); the sticky-chain map is

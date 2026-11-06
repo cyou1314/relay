@@ -19,6 +19,13 @@
  *  - "FAIL_DROP"    -> stream: one chunk is sent, then the socket is destroyed
  *                      mid-stream; non-stream: socket destroyed pre-response
  * Also serves GET /v1/models with two mock model ids.
+ *
+ * Gap-fix additions (G1 redirect test):
+ *  - MOCK_REDIRECT_LOCATION: when set, every POST is answered 302 with
+ *    that Location and nothing else (the instance plays the redirecting
+ *    upstream; a second instance at the Location URL plays the target).
+ *  - Every request path is counted; GET /__hits returns the counts as
+ *    JSON, so a test can prove an endpoint was NEVER contacted.
  */
 const http = require('node:http');
 
@@ -38,6 +45,8 @@ const FAIL_STATUS = process.env.MOCK_FAIL_STATUS ? Number(process.env.MOCK_FAIL_
 const FAIL_CODE = process.env.MOCK_FAIL_CODE || 'mock_forced_failure';
 const FAIL_MESSAGE = process.env.MOCK_FAIL_MESSAGE || 'mock forced failure';
 const MODEL_IDS = (process.env.MOCK_MODEL_IDS || 'mock-model,mock-model-2').split(',').map((s) => s.trim()).filter(Boolean);
+const REDIRECT_LOCATION = process.env.MOCK_REDIRECT_LOCATION || null;
+const hits = {}; // url -> count, for the G1 "target never contacted" proof
 
 function plan(body) {
   const messages = body.messages || [];
@@ -134,7 +143,18 @@ function handleChatNormal(req, res, body) {
 }
 
 const server = http.createServer((req, res) => {
+  hits[req.url] = (hits[req.url] || 0) + 1;
   if (req.method === 'GET' && req.url === '/health') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); return; }
+  if (req.method === 'GET' && req.url === '/__hits') {
+    const s = JSON.stringify(hits);
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(s) }); res.end(s); return;
+  }
+  if (REDIRECT_LOCATION && req.method === 'POST') {
+    // Redirecting-upstream mode: 302 + Location, no body, nothing else.
+    res.writeHead(302, { location: REDIRECT_LOCATION });
+    res.end();
+    return;
+  }
   if (req.method === 'GET' && req.url === '/v1/models') {
     const s = JSON.stringify({ object: 'list', data: MODEL_IDS.map((id) => ({ id, object: 'model', created: 1700000000, owned_by: 'mock' })) });
     res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(s) });

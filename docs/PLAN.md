@@ -116,6 +116,10 @@ Local web dashboard (quota, routing history, spend/savings, rule editor),
 launchd autostart + crash restart.
 **Accept:** gateway survives a reboot and Codex notices nothing; dashboard
 reconciles with the routing log.
+Also scheduled in this stage (gap audit G3): natural-language rule input
+on top of the structured editor — NL text → a structured rule *draft*
+(compiled by the difficulty-v2 judge-model call) → shown to the user →
+takes effect only after explicit confirmation. No regex "NL" parser.
 
 ### M5 — Hardening (ongoing)
 Codex version-compat checks (config format drift), Gemini OAuth path
@@ -126,6 +130,29 @@ small-model classifier routing (v2), other agents as entry points, HUD.
 Only after the personal version is proven: naming/branding, signing &
 notarization, auto-update, and whether a public distribution keeps the
 pure-local shape. This decision blocks nothing in M0–M5.
+
+### Gap-audit dispositions (2026-11-06, from docs/GAP-AUDIT.md)
+
+So the audit's verdicts live where future planning reads them:
+
+- **G3 — Natural-language routing rules:** scheduled in M4 (dashboard
+  stage), in the form: natural language → structured rule draft →
+  user confirms before it takes effect. See the M4 entry above.
+- **G5 — Local endpoint authentication:** scheduled in the credentials
+  phase (the resequenced final phase). Management-class endpoints
+  (`POST /v1/feedback` today; any future admin/config endpoints) get a
+  local token; whether the request-forwarding path (`/v1/responses`)
+  also requires one — and what that does to client compatibility — is
+  decided in that phase, not by default.
+- **G4 — Accessibility window binding / composer-UI control:**
+  explicitly **rejected**; reasoning recorded in
+  `docs/LEARNING-FROM-AUTOROUTER.md` (Reject section).
+- **G6 — Redacted diagnostics export:** **rejected for the self-use
+  stage**, revisit at the productization fork / M5; reasoning in
+  `docs/LEARNING-FROM-AUTOROUTER.md` (Reject section).
+- **G1 / G2** were fixed in code before the credentials phase (redirect
+  refusal test-locked; error taxonomy gained `auth` / `invalid`
+  classes) — see the fix record appended to `docs/GAP-AUDIT.md`.
 
 ## 5. Risks
 

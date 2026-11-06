@@ -45,15 +45,33 @@
  *   - src/upstreams.js  registry of configured upstreams (kind/tier/price)
  *   - src/quota.js      quota sources (mock / metering-estimate / unavailable)
  *   - src/router.js     priority + stickiness + pins + sensitive fail-closed
+ *   - src/difficulty.js task-difficulty classifier (second routing axis)
  * Every ATTEMPT is logged with requestId, chosen upstream, attempt number,
- * the decision reasonCode and a quota snapshot. Routed reasonCodes:
+ * the decision reasonCode, a quota snapshot, the difficulty verdict
+ * ({level, score} + signals on the line) and the model actually served
+ * (servedModel — one specific model of the chosen upstream, picked by
+ * capability; see src/router.js). Routed reasonCodes:
  *   initial          first attempt, automatic policy pick
  *   pinned           first attempt, a cwd rule pinned this upstream
  *   sticky_session   first attempt, this session chain already lives here
  *   fallback_quota   previous attempt failed on quota/429
  *   fallback_filtered previous attempt was refused by a safety filter
+ *   fallback_auth    previous attempt's upstream rejected its credential
+ *                    (401/403 — that upstream's key is dead; other
+ *                    upstreams hold independent credentials)
  *   fallback_error   previous attempt failed otherwise (5xx/connect/timeout)
+ *   invalid_request_stop  an upstream proved the REQUEST itself invalid
+ *                    (400 + context_length_exceeded / invalid_request):
+ *                    the fallback chain stopped immediately and the
+ *                    upstream error was returned to the client as-is
  *   sensitive_block  sensitive project, no subscription upstream: refused
+ *   difficulty_light_preserve  light task, subscription quota scarce:
+ *                       a cheap API leads so quota survives for heavy work
+ *   difficulty_upgrade  the chain's upstream has no model graded for
+ *                       this task's level; the session moved up
+ *   difficulty_underpowered  NO upstream has a model graded for this
+ *                       level; the strongest available served anyway and
+ *                       the downgrade is on the record, never silent
  *   client_abort / upstream_error as in legacy mode
  * With no config file the gateway behaves exactly as M1 (legacy mode).
  *
@@ -70,6 +88,7 @@ const { loadConfig } = require('./config');
 const { createRegistry, resolveTarget, classifyFailure, fallbackReasonCode } = require('./upstreams');
 const { createQuotaService } = require('./quota');
 const routerEngine = require('./router');
+const difficultyEngine = require('./difficulty');
 
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.RELAY_PORT || 18923);
@@ -143,6 +162,21 @@ const rid = (p) => p + crypto.randomBytes(12).toString('hex');
 const isTimeoutErr = (err) => Boolean(err) && err.code === 'RELAY_TIMEOUT';
 
 // ---------------------------------------------------------------------------
+// REDIRECT POLICY — deliberate, do not "fix".
+// Every upstream request in this file is issued with raw node:http/https,
+// which NEVER follows redirects, and Relay adds no redirect handling on
+// top. This is intentional: these requests carry credentials (the
+// caller's Authorization header in passthrough, an upstream's API key in
+// translate/routed). If an upstream answers 3xx, the response is handed
+// back to the client as-is (passthrough) or surfaced as an ordinary
+// upstream failure (translate/routed) — it is NEVER automatically chased
+// to the Location host. Following it would re-send the credential
+// headers to a host the operator never configured: a credential
+// exfiltration hole. If this file is ever refactored onto a
+// redirect-following client (fetch defaults to following!), redirect
+// handling MUST be disabled there. Locked in by test 30 (mock answers
+// 302 -> gateway returns 302 untouched, redirect target never contacted).
+// ---------------------------------------------------------------------------
 // low-level upstream POST with timeout; resolves with the response stream as
 // soon as headers arrive. Rejects only for pre-header failures.
 // ---------------------------------------------------------------------------
@@ -208,6 +242,9 @@ function handlePassthrough(req, res, rawBody, startedAt, upstreamUrlStr, model) 
     }
     if (rawBody.length) headers['content-length'] = rawBody.length;
     const lib = target.protocol === 'http:' ? http : https;
+    // Raw http/https: a 3xx is piped back to the client as-is and never
+    // followed with the caller's Authorization attached — see the
+    // REDIRECT POLICY note above upstreamAttempt. Do not add following.
     let up;
     const timer = setTimeout(() => {
       const err = new Error(`upstream timeout after ${TIMEOUT_MS}ms`);
@@ -578,6 +615,8 @@ function attemptPassthrough(req, res, rawBody, targetUrl) {
     }
     if (rawBody.length) headers['content-length'] = rawBody.length;
     const lib = target.protocol === 'http:' ? http : https;
+    // Raw http/https, no redirect following (REDIRECT POLICY above
+    // upstreamAttempt): a 3xx is returned to the client untouched.
     let up = null;
     let clientAborted = false;
     res.on('close', () => {
@@ -659,6 +698,10 @@ function attemptPassthrough(req, res, rawBody, targetUrl) {
 // restarts, chains re-decide from policy, which PLAN §3.1 tolerates
 // (switching is defined at session start; a restart starts fresh).
 const stickyChains = new Map();
+// responseId -> the previous_response_id it was chained from. Lets the
+// difficulty classifier see chain DEPTH (a difficulty signal) instead
+// of just chain membership. Same in-memory lifetime as stickyChains.
+const responseParent = new Map();
 function chainKeyFor(req, body) {
   if (body && typeof body.previous_response_id === 'string' && body.previous_response_id) return 'prev:' + body.previous_response_id;
   const sid = req.headers['session-id'] || req.headers['x-session-id'] || req.headers.session_id;
@@ -667,8 +710,24 @@ function chainKeyFor(req, body) {
 }
 function rememberChain(key, responseId, upstreamId) {
   if (stickyChains.size > 10000) stickyChains.clear();
+  if (responseParent.size > 10000) responseParent.clear();
   if (key) stickyChains.set(key, upstreamId);
-  if (responseId) stickyChains.set('prev:' + responseId, upstreamId);
+  if (responseId) {
+    stickyChains.set('prev:' + responseId, upstreamId);
+    if (key && key.startsWith('prev:')) responseParent.set(responseId, key.slice(5));
+  }
+}
+/** Depth of the previous_response_id chain behind this request (0 = fresh chain). */
+function chainDepthFor(body) {
+  let depth = 0;
+  let cur = body && typeof body.previous_response_id === 'string' ? body.previous_response_id : null;
+  const seen = new Set();
+  while (cur && !seen.has(cur) && depth < 64) {
+    seen.add(cur);
+    depth++;
+    cur = responseParent.get(cur) || null;
+  }
+  return depth;
 }
 
 /**
@@ -691,9 +750,17 @@ async function handleRouted(req, res, rawBody, startedAt) {
   const chainKey = body ? chainKeyFor(req, body) : null;
   const stickyId = chainKey ? (stickyChains.get(chainKey) || null) : null;
   const cwd = cwdFor(req, body);
+  // Difficulty axis: classify before deciding; the verdict (level/score
+  // on every attempt line, signals included for explainability) rides
+  // along into the routing log.
+  const difficulty = body
+    ? difficultyEngine.classify(body, { chainDepth: chainDepthFor(body) })
+    : { level: 'standard', score: 0, signals: [] };
   const logAttempt = (fields) => logRoute({
     requestId, path: '/v1/responses', mode: 'routed', upstream: null, model: body ? (body.model || null) : null,
-    cwd: cwd || null, authPresent: Boolean(req.headers.authorization), ms: Date.now() - startedAt, ...fields,
+    cwd: cwd || null, authPresent: Boolean(req.headers.authorization), ms: Date.now() - startedAt,
+    difficulty: { level: difficulty.level, score: difficulty.score, signals: difficulty.signals },
+    servedModel: null, ...fields,
   });
 
   if (!body) {
@@ -704,7 +771,7 @@ async function handleRouted(req, res, rawBody, startedAt) {
 
   const decision = routerEngine.decide({
     registry, rules: CONFIG.rules, settings: CONFIG.settings,
-    quotas, cwd, stickyUpstreamId: stickyId,
+    quotas, cwd, stickyUpstreamId: stickyId, difficulty,
   });
 
   if (decision.blocked) {
@@ -722,11 +789,15 @@ async function handleRouted(req, res, rawBody, startedAt) {
   let lastMapped = null;
   let lastStatus = 502;
   for (let i = 0; i < decision.candidates.length; i++) {
-    const { upstream, reason } = decision.candidates[i];
+    const { upstream, reason, model: chosenModel } = decision.candidates[i];
     const reasonCode = i === 0 ? (reason || 'initial') : fallbackReasonCode(lastFailureKind);
     const q = quotas[upstream.id] || { remainingPct: null, source: 'unavailable' };
     const quotaSnap = { remainingPct: q.remainingPct, source: q.source, ...(q.resetsAt ? { resetsAt: q.resetsAt } : {}) };
     const target = resolveTarget(upstream);
+    // The router picked one specific model of this upstream (by
+    // capability); it overrides the upstream's pinned dispatch model.
+    if (chosenModel) target.model = chosenModel;
+    const servedModel = chosenModel || target.model || (body && body.model) || null;
     let r;
     if (!target.baseUrl) {
       r = { outcome: 'failure', failureKind: 'error', status: 502, mapped: { message: `upstream ${upstream.id} has no baseUrl configured`, type: 'relay_config_error', code: 'missing_base_url' } };
@@ -744,24 +815,32 @@ async function handleRouted(req, res, rawBody, startedAt) {
     }
 
     if (r.outcome === 'success') {
-      logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: r.status || 200, reasonCode, quota: quotaSnap, usage: r.usage || null, ...(decision.sensitive ? { sensitive: true } : {}) });
+      logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: r.status || 200, reasonCode, quota: quotaSnap, usage: r.usage || null, servedModel, ...(decision.sensitive ? { sensitive: true } : {}), ...(decision.underpowered ? { underpowered: true } : {}) });
       rememberChain(chainKey, r.responseId, upstream.id);
       return;
     }
     if (r.outcome === 'client_abort') {
-      logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: 499, reasonCode: 'client_abort', quota: quotaSnap });
+      logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: 499, reasonCode: 'client_abort', quota: quotaSnap, servedModel });
       if (!res.writableEnded && !res.headersSent) res.end();
       return;
     }
     if (r.outcome === 'stream_broken') {
       // Bytes already reached the client: no fallback is possible.
-      logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: 502, reasonCode: 'upstream_error', quota: quotaSnap, error: r.errorCode || 'upstream_stream_broken' });
+      logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: 502, reasonCode: 'upstream_error', quota: quotaSnap, error: r.errorCode || 'upstream_stream_broken', servedModel });
       return;
     }
     lastFailureKind = r.failureKind || 'error';
     lastMapped = r.mapped || null;
     lastStatus = r.status || 502;
-    logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: lastStatus, reasonCode, quota: quotaSnap, error: lastMapped ? lastMapped.code : null, willFallback: i < decision.candidates.length - 1 });
+    // 'invalid' = the request itself is at fault (context-length
+    // overflow, malformed request): no other upstream can serve it, so
+    // the chain STOPS here instead of burning every remaining candidate,
+    // and the upstream's error is returned to the client as-is below.
+    // The stop is the salient fact of this attempt, so it owns the
+    // log line's reasonCode.
+    const stopForInvalid = lastFailureKind === 'invalid';
+    logAttempt({ chosen: upstream.id, upstream: upstream.id, attempt: i + 1, status: lastStatus, reasonCode: stopForInvalid ? 'invalid_request_stop' : reasonCode, quota: quotaSnap, error: lastMapped ? lastMapped.code : null, willFallback: !stopForInvalid && i < decision.candidates.length - 1, servedModel });
+    if (stopForInvalid) break;
   }
   if (!res.headersSent) {
     sendError(res, lastStatus, lastMapped ? lastMapped.message : 'all upstreams failed', lastMapped ? lastMapped.type : 'relay_upstream_error', lastMapped ? lastMapped.code : null);
@@ -798,7 +877,7 @@ async function handleModels(req, res, url, startedAt) {
     // declared models (falling back to their pinned `model` values).
     const ids = [];
     for (const u of registry.enabled()) {
-      for (const m of [...u.models, ...(u.model ? [u.model] : [])]) if (!ids.includes(m)) ids.push(m);
+      for (const m of [...u.models.map((x) => x.id), ...(u.model ? [u.model] : [])]) if (!ids.includes(m)) ids.push(m);
     }
     logRoute({ path: '/v1/models', mode: 'routed', upstream: null, model: null, authPresent: Boolean(req.headers.authorization), status: 200, reasonCode: 'initial', ms: Date.now() - startedAt });
     sendJson(res, 200, { object: 'list', data: ids.map((id) => ({ id, object: 'model', created: 0, owned_by: 'relay' })) });

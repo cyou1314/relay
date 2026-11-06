@@ -23,6 +23,24 @@ const DEFAULT_CONFIG_PATH = path.join(REPO_ROOT, 'relay.config.json');
 
 const TIERS = ['subscription', 'cheap-api', 'premium-api'];
 const KINDS = ['passthrough', 'chat'];
+const CAPABILITIES = ['light', 'standard', 'heavy'];
+
+/**
+ * Normalize one model entry of an upstream. Two accepted shapes:
+ *   "model-id"                                  (legacy; capability 'standard')
+ *   { "id": "model-id", "capability": "heavy" } (difficulty axis)
+ * The capability grades what the model can be trusted with; the router
+ * never sends a task to a model graded below the task's difficulty
+ * unless nothing adequate exists (see router.js / DIFFICULTY-REPORT.md).
+ */
+function normalizeModel(raw, upstreamId) {
+  if (typeof raw === 'string') return { id: raw, capability: 'standard' };
+  if (raw && typeof raw === 'object' && typeof raw.id === 'string') {
+    const capability = CAPABILITIES.includes(raw.capability) ? raw.capability : 'standard';
+    return { id: raw.id, capability };
+  }
+  throw new Error(`upstream ${upstreamId}: model entries must be strings or {id, capability}`);
+}
 
 function configPath() {
   return process.env.RELAY_CONFIG || DEFAULT_CONFIG_PATH;
@@ -46,7 +64,9 @@ function normalizeUpstream(raw, idx) {
     apiKeyEnv: typeof raw.apiKeyEnv === 'string' ? raw.apiKeyEnv : null,
     // Model to send upstream; null = pass the client's requested model through.
     model: typeof raw.model === 'string' ? raw.model : null,
-    models: Array.isArray(raw.models) ? raw.models.filter((m) => typeof m === 'string') : [],
+    // Capability of the pinned `model` above (models[] entries carry their own).
+    modelCapability: CAPABILITIES.includes(raw.modelCapability) ? raw.modelCapability : 'standard',
+    models: Array.isArray(raw.models) ? raw.models.map((m) => normalizeModel(m, raw.id)) : [],
     price: {
       inputPer1k: Number(price.inputPer1k || 0),
       outputPer1k: Number(price.outputPer1k || 0),
@@ -83,10 +103,16 @@ function loadConfig() {
     quotaFloorPct: Number((parsed.settings || {}).quotaFloorPct ?? 2),
     // remainingPct at/above this counts as "ample" subscription quota.
     amplePct: Number((parsed.settings || {}).amplePct ?? 25),
+    // Difficulty axis: when every subscription's known remaining quota is
+    // below this, LIGHT tasks are sent to cheap APIs first so the scarce
+    // subscription quota is preserved for heavier work later
+    // (reason difficulty_light_preserve).
+    preservePct: Number((parsed.settings || {}).preservePct ?? 30),
     ...(parsed.settings || {}),
   };
   settings.quotaFloorPct = Number(settings.quotaFloorPct);
   settings.amplePct = Number(settings.amplePct);
+  settings.preservePct = Number(settings.preservePct);
   return {
     path: p,
     upstreams,
@@ -95,4 +121,4 @@ function loadConfig() {
   };
 }
 
-module.exports = { loadConfig, configPath, normalizeUpstream, TIERS, KINDS };
+module.exports = { loadConfig, configPath, normalizeUpstream, normalizeModel, TIERS, KINDS, CAPABILITIES };

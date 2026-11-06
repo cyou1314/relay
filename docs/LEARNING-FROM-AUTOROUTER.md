@@ -15,7 +15,7 @@ deliberately reject — so the borrowing is a design decision, not an accident.
 | Routing reason codes + decision cache + local routing history | Every decision is explainable after the fact; caching keeps per-turn decisions consistent and cheap | M3: every routing log line carries a reason code; session decision cache |
 | Per-turn feedback (👍/👎 on each routing pick) feeding future decisions | Routing quality compounds from real usage instead of static rules | M3/M4: one-click feedback in the dashboard, stored locally, tunes rules |
 | Version-compatibility gating (refusing to touch configs of a too-old agent, with a clear message) | Prevents the worst failure class: corrupting a config format you don't understand | M1: Codex version check before any config write |
-| Redirect-refusal on credential-carrying HTTP clients; RSA encryption + signed key manifests for credential exchange | Small, cheap defenses exactly where credentials move | M2: all OAuth-carrying clients refuse redirects; catalog integrity pinned |
+| Redirect-refusal on credential-carrying HTTP clients; RSA encryption + signed key manifests for credential exchange | Small, cheap defenses exactly where credentials move | Redirect-refusal: landed — raw `node:http` never follows, the policy is commented at the HTTP layer and locked by test 30 (GAP-AUDIT G1); catalog integrity pinned when a catalog channel exists |
 | Real-time routing toast ("this turn → model X, because Y, cost Z") | Instant trust: the user sees the router work, not just its bill | M4 dashboard live feed (we skip the floating HUD window, not the immediacy) |
 | Honest estimation labels (their docs spell out how weekly-meter estimates are split across sessions) | Estimates labeled as estimates, with the method stated | M2: Gemini quota always labeled "estimate" + method note |
 | Demo fixtures for UI development (bundled fake traces) | UI can be built and reviewed without touching real data | M4: dashboard ships with fixture mode |
@@ -50,3 +50,19 @@ deliberately reject — so the borrowing is a design decision, not an accident.
   default). Relay ships zero telemetry; logs are local files the user owns.
 - **Breadth over depth** (many agents, enterprise surface, growth quests).
   Relay does one stack deeply.
+- **Accessibility window binding / composer-UI model switching**
+  (AutoRouter traverses other apps' window trees to bind windows to
+  sessions and operates Codex's composer UI to switch models). Relay
+  decides at the protocol layer — the provider block in `config.toml`
+  plus `/v1/models` — so UI automation buys nothing functionally, while
+  costing exactly the Accessibility / Screen Recording permission
+  surface the reverse report flags as risk. **Explicitly rejected**
+  (gap audit G4, recorded 2026-11-06) — a future sweep must not re-flag
+  this as a missing capability.
+- **Redacted diagnostics export — for the self-use stage.** AutoRouter
+  ships an in-app diagnostic report (metadata + demo events, no
+  bodies/credentials). At Relay's self-use stage the local JSONL logs
+  already ARE the diagnostics, owned by the user on their own machine;
+  an export bundle only earns its keep when someone else needs to read
+  them. **Rejected for now** (gap audit G6, recorded 2026-11-06);
+  revisit at the productization fork / M5 hardening, not before.

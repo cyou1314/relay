@@ -321,6 +321,21 @@ try {
   const entriesOf = (log) => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '').trim().split('\n').filter(Boolean)
     .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e && e.path === '/v1/responses');
   const lastAttempt = (log) => { const es = entriesOf(log); return es[es.length - 1]; };
+  // The gateway sends the response inside the attempt and appends the
+  // attempt's log line immediately after; a test that reads the file the
+  // instant its fetch resolves can win that race. Settle = poll until the
+  // file size is stable across two checks (bounded), then read.
+  const settleLog = async (log, timeoutMs = 2000) => {
+    const t0 = Date.now();
+    let prev = -1;
+    while (Date.now() - t0 < timeoutMs) {
+      const size = fs.existsSync(log) ? fs.statSync(log).size : 0;
+      if (size > 0 && size === prev) return;
+      prev = size;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  };
+  const lastAttemptWait = async (log) => { await settleLog(log); return lastAttempt(log); };
 
   // ---- Phase A: priority, stickiness, pin, sensitive-allowed, feedback --
   const logA = path.join(coreDir, 'routing-a.jsonl');
@@ -335,7 +350,7 @@ try {
     const { status, json } = await routedPost(A, { model: 'mock-model', input: 'say hello', stream: false });
     check('status 200', status === 200, `got ${status}`);
     check('served by subscription upstream', textOf(json) === 'Hello from sub upstream.', textOf(json));
-    const e = lastAttempt(logA);
+    const e = await lastAttemptWait(logA);
     check('log chosen sub-main + reason initial', e && e.chosen === 'sub-main' && e.reasonCode === 'initial', JSON.stringify(e));
     check('log carries quota snapshot (mock 80%)', e && e.quota && e.quota.remainingPct === 80 && e.quota.source === 'mock', JSON.stringify(e && e.quota));
     const models = await (await fetch(`${A}/v1/models`)).json();
@@ -348,7 +363,7 @@ try {
     setSubQuota(0);
     const { json } = await routedPost(A, { model: 'mock-model', input: 'say hello', stream: false });
     check('served by cheap API', textOf(json) === 'Hello from cheap upstream.', textOf(json));
-    const e = lastAttempt(logA);
+    const e = await lastAttemptWait(logA);
     check('log chosen cheap-api + reason initial', e && e.chosen === 'cheap-api' && e.reasonCode === 'initial', JSON.stringify(e));
   }
 
@@ -360,7 +375,7 @@ try {
     setSubQuota(0);
     const second = await routedPost(A, { model: 'mock-model', input: 'say hello again', previous_response_id: first.json.id, stream: false });
     check('chained request still on subscription', textOf(second.json) === 'Hello from sub upstream.', textOf(second.json));
-    const e = lastAttempt(logA);
+    const e = await lastAttemptWait(logA);
     check('log reason sticky_session', e && e.chosen === 'sub-main' && e.reasonCode === 'sticky_session', JSON.stringify(e));
   }
 
@@ -369,7 +384,7 @@ try {
     setSubQuota(80);
     const { json } = await routedPost(A, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/pinned-proj/src' });
     check('served by pinned premium upstream', textOf(json) === 'Hello from premium upstream.', textOf(json));
-    const e = lastAttempt(logA);
+    const e = await lastAttemptWait(logA);
     check('log chosen premium-api + reason pinned', e && e.chosen === 'premium-api' && e.reasonCode === 'pinned', JSON.stringify(e));
   }
 
@@ -378,7 +393,7 @@ try {
     const { status, json } = await routedPost(A, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/secret-proj' });
     check('status 200', status === 200, `got ${status}`);
     check('served by subscription upstream', textOf(json) === 'Hello from sub upstream.', textOf(json));
-    const e = lastAttempt(logA);
+    const e = await lastAttemptWait(logA);
     check('log marks sensitive routing', e && e.chosen === 'sub-main' && e.sensitive === true, JSON.stringify(e));
   }
 
@@ -427,6 +442,7 @@ try {
     const { status, json } = await routedPost(B, { model: 'mock-model', input: 'say hello', stream: false });
     check('status 200 via fallback', status === 200, `got ${status}`);
     check('landed on premium upstream', textOf(json) === 'Hello from premium upstream.', textOf(json));
+    await settleLog(logB);
     const es = entriesOf(logB);
     const reqId = es[es.length - 1].requestId;
     const attempts = es.filter((e) => e.requestId === reqId);
@@ -445,6 +461,7 @@ try {
     const { status, json } = await routedPost(B2, { model: 'mock-model', input: 'say hello', stream: false });
     check('status 200 via fallback', status === 200, `got ${status}`);
     check('landed on cheap upstream', textOf(json) === 'Hello from cheap upstream.', textOf(json));
+    await settleLog(logB2);
     const es = entriesOf(logB2);
     const attempts = es.filter((e) => e.requestId === es[es.length - 1].requestId);
     check('attempt 2 reason fallback_filtered', attempts.length === 2 && attempts[1].chosen === 'cheap-api' && attempts[1].reasonCode === 'fallback_filtered', JSON.stringify(attempts));
@@ -459,10 +476,197 @@ try {
     const { status, json } = await routedPost(C, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/secret-proj' });
     check('refused with 403', status === 403, `got ${status}`);
     check('error code sensitive_block + fail-closed message', json.error && json.error.code === 'sensitive_block' && /fail-closed/i.test(json.error.message), JSON.stringify(json).slice(0, 200));
-    const e = lastAttempt(logC);
+    const e = await lastAttemptWait(logC);
     check('log reasonCode sensitive_block, nothing chosen', e && e.reasonCode === 'sensitive_block' && e.chosen === null, JSON.stringify(e));
     const okReq = await routedPost(C, { model: 'mock-model', input: 'say hello', stream: false }, { 'x-relay-cwd': '/work/public-proj' });
     check('non-sensitive cwd on same gateway still routes', okReq.status === 200 && textOf(okReq.json) === 'Hello from cheap upstream.', `got ${okReq.status}`);
+  }
+
+  // =======================================================================
+  // Difficulty axis: heuristic classifier + capability-graded routing.
+  // Same mock upstreams; configs now grade each model light|standard|heavy.
+  // =======================================================================
+  const gSub = (port, models) => ({ id: 'sub-main', kind: 'chat', tier: 'subscription', baseUrl: `http://127.0.0.1:${port}/v1`, models, quota: { source: 'mock', mockFile: quotaFile } });
+  const gCheap = (port, models) => ({ id: 'cheap-api', kind: 'chat', tier: 'cheap-api', baseUrl: `http://127.0.0.1:${port}/v1`, models, price: PRICES.cheap, quota: { source: 'unavailable' } });
+  const gPrem = (port, models) => ({ id: 'premium-api', kind: 'chat', tier: 'premium-api', baseUrl: `http://127.0.0.1:${port}/v1`, models, price: PRICES.premium, quota: { source: 'unavailable' } });
+  const HEAVY_INPUT = '```\n' + 'x'.repeat(100000) + '\n```'; // ~25k est tokens + code signal -> heavy
+
+  console.log('test 24: difficulty classifier — two typical requests per level, all explainable');
+  {
+    const diffMod = await import('file://' + path.join(root, 'src/difficulty.js'));
+    const classify = diffMod.default.classify;
+    const fiveTools = Array.from({ length: 5 }, (_, i) => ({ type: 'function', name: 'tool_' + i, description: 'd', parameters: { type: 'object', properties: {} } }));
+    const cases = [
+      ['light: bare chat turn', { input: 'say hello' }, 'light'],
+      ['light: short translation ask', { input: 'translate to French: good morning, how are you?' }, 'light'],
+      ['standard: small code fix', { input: 'fix this:\n```js\nlet a = 1\n```' }, 'standard'],
+      ['standard: medium context + tools', { input: 'y'.repeat(12000), tools: fiveTools }, 'standard'],
+      ['heavy: huge code payload', { input: HEAVY_INPUT }, 'heavy'],
+      ['heavy: high effort + long input + deep chain', { input: 'z'.repeat(40000), reasoning: { effort: 'high' } }, 'heavy'],
+    ];
+    for (const [name, body, want] of cases) {
+      const opts = name.includes('deep chain') ? { chainDepth: 4 } : {};
+      const got = classify(body, opts);
+      check(name, got.level === want, `got ${got.level} score=${got.score} signals=${got.signals.join(',')}`);
+      check(name + ' — signals explain the score', got.signals.every((s) => /:\+\d+$/.test(s)) && (got.score === 0 || got.signals.length > 0), got.signals.join(','));
+    }
+  }
+
+  console.log('test 25: heavy task is NOT dropped on a weak cheap API when an adequate model exists');
+  {
+    const logD1 = path.join(coreDir, 'routing-d1.jsonl');
+    const cfgD1 = writeCfg('config-d1.json', [
+      gSub(SUB_PORT, [{ id: 'sub-model', capability: 'standard' }]),
+      gCheap(CHEAP_PORT, [{ id: 'cheap-lite', capability: 'light' }]),
+      gPrem(PREM_PORT, [{ id: 'premium-max', capability: 'heavy' }]),
+    ], []);
+    setSubQuota(80);
+    const D1 = await startRouted(18955, cfgD1, logD1);
+    const { status, json } = await routedPost(D1, { model: 'mock-model', input: HEAVY_INPUT, stream: false });
+    check('status 200', status === 200, `got ${status}`);
+    check('served by the heavy-capable premium upstream', textOf(json) === 'Hello from premium upstream.', textOf(json));
+    const e = await lastAttemptWait(logD1);
+    check('log: chosen premium-api, reason initial', e && e.chosen === 'premium-api' && e.reasonCode === 'initial', JSON.stringify(e));
+    check('log: difficulty heavy + servedModel premium-max', e && e.difficulty && e.difficulty.level === 'heavy' && e.servedModel === 'premium-max', JSON.stringify(e && { d: e.difficulty, m: e.servedModel }));
+  }
+
+  console.log('test 26: heavy task with NO adequate model anywhere — served anyway, downgrade on the record');
+  {
+    const logD2 = path.join(coreDir, 'routing-d2.jsonl');
+    const cfgD2 = writeCfg('config-d2.json', [
+      gSub(SUB_PORT, [{ id: 'sub-model', capability: 'standard' }]),
+      gCheap(CHEAP_PORT, [{ id: 'cheap-lite', capability: 'light' }]),
+    ], []);
+    setSubQuota(80);
+    const D2 = await startRouted(18956, cfgD2, logD2);
+    const { status, json } = await routedPost(D2, { model: 'mock-model', input: HEAVY_INPUT, stream: false });
+    check('status 200 (not refused)', status === 200, `got ${status}`);
+    check('served by the strongest available (subscription)', textOf(json) === 'Hello from sub upstream.', textOf(json));
+    const e = await lastAttemptWait(logD2);
+    check('log: reasonCode difficulty_underpowered + underpowered flag', e && e.reasonCode === 'difficulty_underpowered' && e.underpowered === true, JSON.stringify(e));
+    check('log: servedModel is the strongest model (sub-model)', e && e.servedModel === 'sub-model', JSON.stringify(e));
+  }
+
+  console.log('test 27: light task + scarce subscription quota — cheap API leads to preserve quota');
+  {
+    const logD3 = path.join(coreDir, 'routing-d3.jsonl');
+    const cfgD3 = writeCfg('config-d3.json', [subUp(SUB_PORT), cheapUp(CHEAP_PORT), premUp(PREM_PORT)], []);
+    const D3 = await startRouted(18957, cfgD3, logD3);
+    setSubQuota(20); // below preservePct (30), above the exhaustion floor (2)
+    const { json } = await routedPost(D3, { model: 'mock-model', input: 'say hello', stream: false });
+    check('served by cheap API', textOf(json) === 'Hello from cheap upstream.', textOf(json));
+    const e = await lastAttemptWait(logD3);
+    check('log: reason difficulty_light_preserve, difficulty light', e && e.chosen === 'cheap-api' && e.reasonCode === 'difficulty_light_preserve' && e.difficulty.level === 'light', JSON.stringify(e));
+
+    console.log('test 28: light task + ample subscription quota — quota-first still wins');
+    setSubQuota(80);
+    const r2 = await routedPost(D3, { model: 'mock-model', input: 'say hello again', stream: false });
+    check('served by subscription', textOf(r2.json) === 'Hello from sub upstream.', textOf(r2.json));
+    const e2 = await lastAttemptWait(logD3);
+    check('log: chosen sub-main, reason initial, difficulty light', e2 && e2.chosen === 'sub-main' && e2.reasonCode === 'initial' && e2.difficulty.level === 'light', JSON.stringify(e2));
+  }
+
+  console.log('test 29: sticky chain turns heavy beyond its upstream — session upgrades, on the record');
+  {
+    const logD4 = path.join(coreDir, 'routing-d4.jsonl');
+    const cfgD4 = writeCfg('config-d4.json', [
+      gSub(SUB_PORT, [{ id: 'sub-max', capability: 'heavy' }]),
+      gCheap(CHEAP_PORT, [{ id: 'cheap-std', capability: 'standard' }]),
+    ], []);
+    setSubQuota(0); // subscription exhausted: a standard task lands on cheap
+    const D4 = await startRouted(18958, cfgD4, logD4);
+    const first = await routedPost(D4, { model: 'mock-model', input: 'fix this:\n```js\nlet a = 1\n```', stream: false });
+    check('first (standard) request served by cheap', textOf(first.json) === 'Hello from cheap upstream.', textOf(first.json));
+    setSubQuota(80);
+    const second = await routedPost(D4, { model: 'mock-model', input: HEAVY_INPUT, previous_response_id: first.json.id, stream: false });
+    check('heavy follow-up moved OFF the incapable sticky upstream', textOf(second.json) === 'Hello from sub upstream.', textOf(second.json));
+    const e = await lastAttemptWait(logD4);
+    check('log: chosen sub-main, reason difficulty_upgrade, servedModel sub-max', e && e.chosen === 'sub-main' && e.reasonCode === 'difficulty_upgrade' && e.servedModel === 'sub-max', JSON.stringify(e));
+  }
+
+  // =======================================================================
+  // Gap-audit fixes (GAP-AUDIT.md): G1 redirect refusal locked by test,
+  // G2 error taxonomy extended with auth / invalid classes.
+  // =======================================================================
+  const REDIR_SRC_PORT = 18967, REDIR_TGT_PORT = 18968, AUTH_PORT = 18969, INV_A_PORT = 18970, INV_B_PORT = 18971;
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(REDIR_SRC_PORT), MOCK_REDIRECT_LOCATION: `http://127.0.0.1:${REDIR_TGT_PORT}/redirect-target`, MOCK_MODEL_IDS: 'mock-model' });
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(REDIR_TGT_PORT), MOCK_MODEL_IDS: 'mock-model' });
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(AUTH_PORT), MOCK_FAIL_STATUS: '401', MOCK_FAIL_CODE: 'invalid_api_key', MOCK_FAIL_MESSAGE: 'invalid api key provided', MOCK_MODEL_IDS: 'sub-model' });
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(INV_A_PORT), MOCK_FAIL_STATUS: '400', MOCK_FAIL_CODE: 'context_length_exceeded', MOCK_FAIL_MESSAGE: "This model's maximum context length is 128000 tokens, but the request has too many tokens.", MOCK_MODEL_IDS: 'sub-model' });
+  start(['test/mock-upstream.js'], { MOCK_PORT: String(INV_B_PORT), MOCK_FAIL_STATUS: '400', MOCK_FAIL_CODE: 'context_length_exceeded', MOCK_FAIL_MESSAGE: "This model's maximum context length is 128000 tokens, but the request has too many tokens.", MOCK_MODEL_IDS: 'cheap-model' });
+  for (const p of [REDIR_SRC_PORT, REDIR_TGT_PORT, AUTH_PORT, INV_A_PORT, INV_B_PORT]) await waitHealth(`http://127.0.0.1:${p}/health`);
+
+  console.log('test 30 (G1): upstream 302 is returned untouched — never followed with credentials attached');
+  {
+    const logG1 = path.join(coreDir, 'routing-g1.jsonl');
+    const cfgG1 = writeCfg('config-g1.json',
+      [{ id: 'redir-pt', kind: 'passthrough', tier: 'subscription', baseUrl: `http://127.0.0.1:${REDIR_SRC_PORT}/v1/responses`, models: ['mock-model'], quota: { source: 'unavailable' } }], []);
+    const G1GW = await startRouted(18959, cfgG1, logG1);
+    const r = await fetch(`${G1GW}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${SECRET}` },
+      body: JSON.stringify({ model: 'mock-model', input: 'say hello', stream: false }),
+      redirect: 'manual', // the TEST client must not follow either; we assert what the gateway did
+    });
+    await r.text();
+    check('gateway returns the 302 status untouched', r.status === 302, `got ${r.status}`);
+    check('Location header preserved verbatim', r.headers.get('location') === `http://127.0.0.1:${REDIR_TGT_PORT}/redirect-target`, r.headers.get('location'));
+    const targetHits = await (await fetch(`http://127.0.0.1:${REDIR_TGT_PORT}/__hits`)).json();
+    check('redirect target endpoint NEVER contacted (hit counter proves it)', !targetHits['/redirect-target'], JSON.stringify(targetHits));
+    const e = await lastAttemptWait(logG1);
+    check('log: 302 attempt recorded cleanly, no error anomaly', Boolean(e) && e.chosen === 'redir-pt' && e.status === 302 && !e.error, JSON.stringify(e));
+  }
+
+  console.log('test 31 (G2): upstream 401 (dead credential) falls back once, logged as fallback_auth');
+  {
+    const logG2a = path.join(coreDir, 'routing-g2a.jsonl');
+    const cfgG2a = writeCfg('config-g2a.json', [subUp(AUTH_PORT), cheapUp(CHEAP_PORT)], []);
+    setSubQuota(80);
+    const G2A = await startRouted(18960, cfgG2a, logG2a);
+    const { status, json } = await routedPost(G2A, { model: 'mock-model', input: 'say hello', stream: false });
+    check('status 200 via fallback', status === 200, `got ${status}`);
+    check('landed on the independent-credential cheap upstream', textOf(json) === 'Hello from cheap upstream.', textOf(json));
+    await settleLog(logG2a);
+    const es = entriesOf(logG2a);
+    const attempts = es.filter((e) => e.requestId === es[es.length - 1].requestId);
+    check('exactly two attempts', attempts.length === 2, `got ${attempts.length}`);
+    check('attempt 1: sub-main, 401', attempts[0].chosen === 'sub-main' && attempts[0].status === 401, JSON.stringify(attempts[0]));
+    check('attempt 2: cheap-api, reasonCode fallback_auth, 200', attempts[1].chosen === 'cheap-api' && attempts[1].reasonCode === 'fallback_auth' && attempts[1].status === 200, JSON.stringify(attempts[1]));
+    check('dead-credential upstream attempted exactly once (no same-upstream retry)', attempts.filter((a) => a.chosen === 'sub-main').length === 1);
+  }
+
+  console.log('test 32 (G2): context-length error stops the chain at the first upstream, error passed through');
+  {
+    const logG2b = path.join(coreDir, 'routing-g2b.jsonl');
+    const cfgG2b = writeCfg('config-g2b.json', [subUp(INV_A_PORT), cheapUp(INV_B_PORT), premUp(PREM_PORT)], []);
+    setSubQuota(80);
+    const G2B = await startRouted(18972, cfgG2b, logG2b);
+    const { status, json } = await routedPost(G2B, { model: 'mock-model', input: 'say hello', stream: false });
+    check('client gets the upstream 400', status === 400, `got ${status}`);
+    check('upstream error code passed through (context_length_exceeded)', Boolean(json.error) && json.error.code === 'context_length_exceeded', JSON.stringify(json).slice(0, 200));
+    check('upstream error message passed through', Boolean(json.error) && json.error.message.includes('maximum context length'), json.error && json.error.message);
+    await settleLog(logG2b);
+    const es = entriesOf(logG2b);
+    const attempts = es.filter((e) => e.requestId === es[es.length - 1].requestId);
+    check('chain stopped after ONE attempt (cheap/premium never tried)', attempts.length === 1 && attempts[0].chosen === 'sub-main', `got ${attempts.length}: ${attempts.map((a) => a.chosen).join(',')}`);
+    check('log reasonCode invalid_request_stop, willFallback false', attempts[0].reasonCode === 'invalid_request_stop' && attempts[0].willFallback === false, JSON.stringify(attempts[0]));
+  }
+
+  console.log('test 33 (G2): classifyFailure unit matrix — new classes + old classes unchanged');
+  {
+    const up = await import('file://' + path.join(root, 'src/upstreams.js'));
+    const cf = up.default.classifyFailure;
+    const frc = up.default.fallbackReasonCode;
+    check('401 + invalid_api_key -> auth', cf({ status: 401, code: 'invalid_api_key', type: 'authentication_error', message: 'invalid api key provided' }) === 'auth');
+    check('403 -> auth', cf({ status: 403, code: 'forbidden', type: '', message: 'Forbidden' }) === 'auth');
+    check('auth body hint alone (400) -> auth', cf({ status: 400, code: 'invalid_api_key', type: 'authentication_error', message: 'bad key' }) === 'auth');
+    check('400 + context_length_exceeded -> invalid', cf({ status: 400, code: 'context_length_exceeded', type: 'invalid_request_error', message: 'maximum context length is 128000 tokens' }) === 'invalid');
+    check('400 + invalid_request -> invalid', cf({ status: 400, code: 'invalid_request', type: 'invalid_request_error', message: 'malformed request' }) === 'invalid');
+    check('context keyword WITHOUT 400 does not stop the chain (500 -> error)', cf({ status: 500, code: 'context_length_exceeded', type: 'server_error', message: 'maximum context length' }) === 'error');
+    check('429 + insufficient_quota -> quota (unchanged)', cf({ status: 429, code: 'insufficient_quota', type: 'rate_limit_error', message: 'plan quota exhausted' }) === 'quota');
+    check('400 + content_filter -> filtered, NOT invalid (precedence unchanged)', cf({ status: 400, code: 'content_filter', type: 'invalid_request_error', message: 'request blocked by safety policy filter' }) === 'filtered');
+    check('500 plain -> error (unchanged)', cf({ status: 500, code: 'mock_internal', type: 'server_error', message: 'mock internal error' }) === 'error');
+    check('fallbackReasonCode: auth -> fallback_auth, old kinds unchanged', frc('auth') === 'fallback_auth' && frc('quota') === 'fallback_quota' && frc('filtered') === 'fallback_filtered' && frc('error') === 'fallback_error');
   }
 } catch (err) {
   failed++;
