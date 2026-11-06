@@ -9,6 +9,16 @@
  *         with arguments {"text":"hello-from-tool"}, finish_reason tool_calls.
  *  - Else -> plain text "Hello from mock upstream."
  * Supports stream and non-stream; usage is fixed (12/7) except tool turns (12/9).
+ *
+ * M1 failure markers (matched against the conversation text):
+ *  - "FAIL_429"     -> HTTP 429 with an OpenAI-style error body
+ *  - "FAIL_500"     -> HTTP 500 with an OpenAI-style error body
+ *  - "FAIL_TIMEOUT" -> response delayed 3000ms (gateway timeout must fire first)
+ *  - "FAIL_ONCE"    -> first request's socket is destroyed pre-response;
+ *                      the retry (same marker) succeeds normally
+ *  - "FAIL_DROP"    -> stream: one chunk is sent, then the socket is destroyed
+ *                      mid-stream; non-stream: socket destroyed pre-response
+ * Also serves GET /v1/models with two mock model ids.
  */
 const http = require('node:http');
 
@@ -32,7 +42,39 @@ function chunk(id, created, model, delta, finishReason) {
   return { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finishReason || null }] };
 }
 
+const failOnceSeen = new Set();
+
+function sendUpstreamError(res, status, message, type, code) {
+  const s = JSON.stringify({ error: { message, type, param: null, code } });
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(s) });
+  res.end(s);
+}
+
 function handleChat(req, res, body) {
+  // --- M1 scripted failure modes, checked before the normal plan ---
+  const allText = (body.messages || []).map((m) => (typeof m.content === 'string' ? m.content : '')).join('\n');
+  if (allText.includes('FAIL_429')) { sendUpstreamError(res, 429, 'mock rate limit exceeded', 'rate_limit_error', 'mock_rate_limit'); return; }
+  if (allText.includes('FAIL_500')) { sendUpstreamError(res, 500, 'mock internal error', 'server_error', 'mock_internal'); return; }
+  if (allText.includes('FAIL_TIMEOUT')) { setTimeout(() => { if (!res.destroyed) handleChatNormal(req, res, body); }, 3000); return; }
+  if (allText.includes('FAIL_ONCE')) {
+    if (!failOnceSeen.has('FAIL_ONCE')) { failOnceSeen.add('FAIL_ONCE'); req.socket.destroy(); return; }
+    handleChatNormal(req, res, body); return;
+  }
+  if (allText.includes('FAIL_DROP')) {
+    if (body.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      const id = 'chatcmpl-mock1'; const created = 1700000000; const model = body.model || 'mock-model';
+      res.write(`data: ${JSON.stringify(chunk(id, created, model, { role: 'assistant', content: 'partial-' }))}\n\n`);
+      setTimeout(() => req.socket.destroy(), 30);
+    } else {
+      req.socket.destroy();
+    }
+    return;
+  }
+  handleChatNormal(req, res, body);
+}
+
+function handleChatNormal(req, res, body) {
   const p = plan(body);
   const id = 'chatcmpl-mock1';
   const created = 1700000000;
@@ -74,6 +116,15 @@ function handleChat(req, res, body) {
 
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); return; }
+  if (req.method === 'GET' && req.url === '/v1/models') {
+    const s = JSON.stringify({ object: 'list', data: [
+      { id: 'mock-model', object: 'model', created: 1700000000, owned_by: 'mock' },
+      { id: 'mock-model-2', object: 'model', created: 1700000000, owned_by: 'mock' },
+    ] });
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(s) });
+    res.end(s);
+    return;
+  }
   if (req.method === 'POST' && req.url === '/v1/chat/completions') {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
